@@ -246,7 +246,99 @@ async function refreshAll(render) {
   renderTextureAndMesh();
   renderCompileCard();
   renderVariantList();
+  renderShaderPanel();
   if (render) await requestFrame();
+}
+
+// ---- 着色器热换面板 ----
+let shaderSourceLoadedFor = null;
+
+function renderShaderPanel() {
+  const prog = state.shaderProgram;
+  const box = $('shaderStatus');
+  const diag = $('shaderDiagnostic');
+  if (!prog) { box.textContent = '当前材质没有着色器程序'; return; }
+  const pub = prog.published;
+  const cand = prog.candidate;
+  const pubState = pub.status === 'ok'
+    ? (pub.matchesCurrentSource ? '已发布（与编辑器文本一致）' : '已发布（编辑器文本尚未编译）')
+    : '未发布（尚无成功版本）';
+  const candState = cand.status === 'compiling' ? '编译中…'
+    : cand.status === 'compiled' ? '候选已采用'
+      : cand.status === 'rejected' ? '候选被拒绝'
+        : cand.status === 'superseded' ? '候选已被更新修订取代'
+          : cand.status === 'rolled-back' ? '已回退' : '空闲';
+  box.innerHTML = `
+    <div class="srow"><span>已发布版本</span><b>${pubState}</b></div>
+    <div class="srow"><span>已发布修订</span><b>rev ${pub.revision} / 编辑 v${pub.editVersion}</b></div>
+    <div class="srow"><span>已发布变体</span><code>${pub.variantKey ?? '—'}</code></div>
+    <div class="srow"><span>绑定布局</span><code>${pub.bindingLayoutHash ?? '—'}</code></div>
+    <div class="srow"><span>候选状态</span><b>${candState}</b></div>
+    <div class="srow"><span>候选修订</span><b>rev ${cand.revision} / 编辑 v${cand.editVersion}${cand.compileMs != null ? ` · ${cand.compileMs.toFixed?.(2)}ms` : ''}</b></div>
+    <div class="srow"><span>文本 vs 画面</span><b>${prog.textDiffersFromPublished ? '文本已改，画面未更新' : '一致'}</b></div>`;
+  const errs = cand.bindingErrors?.length
+    ? cand.bindingErrors.map((e) => `[${e.code}] ${e.message}`).join('\n')
+    : null;
+  if (cand.status === 'rejected') {
+    diag.classList.remove('hidden');
+    diag.textContent = [
+      `候选编译失败：${cand.diagnostic?.stage ?? ''}/${cand.diagnostic?.phase ?? ''}`
+        + (cand.diagnostic?.sourceLine ? ` 行 ${cand.diagnostic.sourceLine}` : ''),
+      cand.diagnostic?.message ?? cand.error ?? '',
+      errs ? `绑定问题：\n${errs}` : '',
+      pub.status === 'ok' ? '→ 画面上仍运行上一份可运行版本' : '→ 当前没有可运行版本',
+    ].filter(Boolean).join('\n');
+  } else {
+    diag.classList.add('hidden');
+  }
+  // 仅在切换材质时载入源码，避免覆盖用户正在编辑的文本
+  if (shaderSourceLoadedFor !== prog.id && cand.status !== 'compiling') {
+    $('shaderSource').value = prog.source ?? '';
+    shaderSourceLoadedFor = prog.id;
+  }
+}
+
+async function saveShaderText() {
+  const accepted = await api('/api/shader/candidate', {
+    source: $('shaderSource').value,
+    materialId: state.currentMaterial.id,
+  });
+  logEvent(`着色器文本已保存 rev <b>${accepted.revision}</b>（画面未更新）`, 'cache-hit');
+  state = await get('/api/state');
+  renderShaderPanel();
+}
+
+async function compileShaderCandidate() {
+  if (busy) return;
+  busy = true; setGlobal('busy', '编译候选着色器…');
+  const box = $('shaderDiagnostic');
+  try {
+    const r = await api('/api/shader/compile', {
+      source: $('shaderSource').value,
+      materialId: state.currentMaterial.id,
+    });
+    state = r.state;
+    if (r.result.adopted) {
+      logEvent(`候选 rev <b>${r.result.revision}</b> 已采用 → ${r.result.variantKey}（影响 ${r.result.affectedInstances} 个实例）`, 'compiled');
+      $('shaderSource').value = state.shaderProgram.source;
+    } else if (r.result.superseded) {
+      logEvent(`候选 rev <b>${r.result.revision}</b> 已被更新修订取代，结果丢弃`, 'failed');
+    } else {
+      logEvent(`候选 rev <b>${r.result.revision}</b> 被拒绝：${r.result.reason}`, 'failed');
+    }
+    await refreshAll(true);
+  } catch (e) {
+    box.classList.remove('hidden');
+    box.textContent = '热换请求失败：' + e.message;
+    setGlobal('err', e.message);
+  } finally { busy = false; }
+}
+
+async function rollbackShader() {
+  const r = await api('/api/shader/rollback', { materialId: state.currentMaterial.id });
+  state = r.state;
+  logEvent(`已回退到已发布版本 <b>${r.result.key ?? '—'}</b>`, 'cache-hit');
+  await refreshAll(true);
 }
 
 // ---- 全局按钮 ----
@@ -321,6 +413,9 @@ $('pitch').oninput = async (e) => {
   scheduleFrame();
 };
 $('resolutionSelect').onchange = () => requestFrame();
+$('shaderSaveBtn').onclick = () => saveShaderText();
+$('shaderCompileBtn').onclick = () => compileShaderCandidate();
+$('shaderRollbackBtn').onclick = () => rollbackShader();
 
 // SSE：编译/帧/预热事件实时推送
 try {
@@ -330,6 +425,8 @@ try {
     if (data.type === 'compile') logEvent(`编译事件：<b>${data.result?.status}</b> 缓存=${data.result?.fromCache}`, 'compiled');
     if (data.type === 'prewarm') logEvent(`预热事件：编译 ${data.report?.compiled} / 跳过 ${data.report?.skipped}`, 'cache-hit');
     if (data.type === 'fault') logEvent(`SSE 故障事件：<b>${data.reason}</b>`, 'failed');
+    if (data.type === 'shader') logEvent(`着色器事件：<b>${data.stage}</b> rev ${data.revision ?? '—'} ${data.reason ? '— ' + data.reason : ''}`,
+      data.stage === 'published' ? 'compiled' : data.stage === 'rejected' ? 'failed' : 'cache-hit');
   };
 } catch { /* 无 SSE 时界面仍可手动操作 */ }
 

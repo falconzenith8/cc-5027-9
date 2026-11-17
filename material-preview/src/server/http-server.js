@@ -114,6 +114,38 @@ export class PreviewServer {
         return json(await svc.verifyReuse(body?.materialId));
       }
 
+      // ---- 运行中着色器热换 ----
+      if (req.method === 'GET' && route === '/api/shader') {
+        return json(svc.shaderProgramState(url.searchParams.get('materialId') ?? undefined));
+      }
+      // 仅受理候选源码（文本保存），不改变画面；返回 revision 供后续运行
+      if (req.method === 'POST' && route === '/api/shader/candidate') {
+        const accepted = svc.submitShaderCandidate(body.source, {
+          materialId: body.materialId,
+          editVersion: body.editVersion,
+        });
+        delete accepted.task;
+        this.broadcast({ type: 'shader', stage: 'submitted', programId: accepted.programId, revision: accepted.revision });
+        return json(accepted);
+      }
+      // 编译候选并按结果发布或保留旧版本；连续保存时旧任务结果被丢弃
+      if (req.method === 'POST' && route === '/api/shader/compile') {
+        const result = await svc.hotSwapShader(body.source, {
+          materialId: body.materialId,
+          editVersion: body.editVersion,
+        });
+        this.broadcast({
+          type: 'shader',
+          stage: result.adopted ? 'published' : result.superseded ? 'superseded' : 'rejected',
+          revision: result.revision, reason: result.reason ?? null,
+        });
+        return json({ result, state: svc.describeState() });
+      }
+      if (req.method === 'POST' && route === '/api/shader/rollback') {
+        const r = svc.rollbackShader(body?.materialId);
+        return json({ result: r, state: svc.describeState() });
+      }
+
       // 故障注入：提交一段非法 GLSL，验证失败诊断与替代材质路径
       if (req.method === 'POST' && route === '/api/fault-injection') {
         const result = await svc.pipeline.compileBroaderSource(body.source, body.struct);

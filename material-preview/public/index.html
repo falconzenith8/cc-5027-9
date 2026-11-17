@@ -70,6 +70,20 @@
       <label>方位角 <input type="range" id="yaw" min="-3.14" max="3.14" step="0.01" value="0.7"></label>
       <label>俯仰角 <input type="range" id="pitch" min="-1.2" max="1.2" step="0.01" value="0.35"></label>
     </div>
+
+    <!-- 运行中着色器热换 -->
+    <h2>着色器源码（运行中热换）<span class="tag danger">编译期</span></h2>
+    <p class="hint">编辑片元源码后先“编译候选”：候选在后台真实编译并检查资源绑定布局，
+      成功才切换到所有受影响材质实例；失败则保留上一份可运行版本并显示具体原因。
+      文本保存本身不会改变画面。</p>
+    <textarea id="shaderSource" rows="12" spellcheck="false"></textarea>
+    <div class="row shader-actions">
+      <button class="btn" id="shaderSaveBtn">保存文本（不更新画面）</button>
+      <button class="btn primary" id="shaderCompileBtn">编译候选并热换</button>
+      <button class="btn warn" id="shaderRollbackBtn">回退到已发布</button>
+    </div>
+    <div class="shader-status" id="shaderStatus"></div>
+    <div id="shaderDiagnostic" class="fault-result hidden"></div>
   </section>
 
   <!-- 右：数值参数 + 编译状态 -->

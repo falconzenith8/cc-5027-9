@@ -173,9 +173,9 @@ export const ENGINE_UNIFORMS = ['u_model', 'u_viewProj', 'u_normalMat', 'u_camer
 export const VERTEX_LAYOUT = Object.freeze({
   stride: 11, // position(3) normal(3) uv(2) tangent(3)
   attributes: [
-    { name: 'a_position', offset: 0, size: 3 },
-    { name: 'a_normal', offset: 3, size: 3 },
-    { name: 'a_uv', offset: 6, size: 2 },
-    { name: 'a_tangent', offset: 8, size: 3 },
+    { name: 'a_position', offset: 0, size: 3, type: 'vec3' },
+    { name: 'a_normal', offset: 3, size: 3, type: 'vec3' },
+    { name: 'a_uv', offset: 6, size: 2, type: 'vec2' },
+    { name: 'a_tangent', offset: 8, size: 3, type: 'vec3' },
   ],
 });

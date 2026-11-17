@@ -11,6 +11,12 @@ export function sha256Short(text) {
   return createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
+// 请求身份：源码 + 参与预处理的宏。宏改变也会改变实际管线，必须反映在身份里。
+export function requestFingerprint(source, defines) {
+  const canonical = JSON.stringify(defines ?? {}, Object.keys(defines ?? {}).sort());
+  return sha256Short(source + '\u0000' + canonical);
+}
+
 export function targetStateFromStruct(struct) {
   // 与 BLEND_MODE 对应的固定函数状态：结构不同 → 状态不同 → 身份不同
   const blend = {
@@ -25,7 +31,9 @@ export function targetStateFromStruct(struct) {
   };
 }
 
-export function buildVariantIdentity({ vertexSource, fragmentSource, layout, struct, stage }) {
+export function buildVariantIdentity({
+  vertexSource, fragmentSource, layout, struct, stage, bindingLayoutHash,
+}) {
   const structCanonical = JSON.stringify(struct, Object.keys(struct).sort());
   const target = targetStateFromStruct(struct);
   const material = {
@@ -36,8 +44,9 @@ export function buildVariantIdentity({ vertexSource, fragmentSource, layout, str
     targetStateHash: sha256Short(JSON.stringify(target)),
     vertexHash: sha256Short(vertexSource),
     fragmentHash: sha256Short(fragmentSource),
+    bindingLayoutHash: bindingLayoutHash ?? null,
   };
-  material.key = [
+  const segments = [
     'v' + COMPILER_VERSION,
     stage,
     's' + sha256Short(structCanonical),
@@ -45,7 +54,10 @@ export function buildVariantIdentity({ vertexSource, fragmentSource, layout, str
     't' + material.targetStateHash,
     'vs' + material.vertexHash,
     'fs' + material.fragmentHash,
-  ].join('|');
+  ];
+  // 自定义源码的热换变体把资源绑定布局并入身份；静态变体保持原有 key 格式。
+  if (bindingLayoutHash) segments.push('b' + bindingLayoutHash);
+  material.key = segments.join('|');
   return material;
 }
 

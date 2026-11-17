@@ -89,13 +89,54 @@ void main() {
     return;
   }
 
+  // 辅助验证：对当前材质做一次热换（图形界面仍是主入口）
+  if (cmd === 'hot-swap') {
+    const bodyFlag = args.flags.body ?? 'tint';
+    const bodies = {
+      tint: 'vec4 c = texture(u_baseColorTex, v_uv) * u_baseColor;\n  c.rgb = c.rgb * 0.3 + vec3(0.0, 0.5, 0.1);\n  fragColor = vec4(c.rgb, 1.0);',
+      broken: 'vec4 c = tex(u_baseColorTex, v_uv);\n  fragColor = c;',
+      rebind: 'fragColor = texture(u_baseColorTex, v_uv) + vec4(0.0, 0.0, 0.2, 0.0);',
+    };
+    const uniforms = bodyFlag === 'rebind'
+      ? `uniform sampler2D u_baseColorTex;`
+      : `uniform vec4 u_baseColor;\nuniform sampler2D u_baseColorTex;\nuniform sampler2D u_occlusionTex;`;
+    const source = `#version 300 es
+precision highp float;
+in vec3 v_worldPos;
+in vec3 v_normal;
+in vec2 v_uv;
+in vec3 v_tangent;
+${uniforms}
+out vec4 fragColor;
+void main() {
+  ${bodies[bodyFlag] ?? bodies.tint}
+}
+`;
+    const result = await svc.hotSwapShader(source);
+    console.log(JSON.stringify({
+      adopted: result.adopted,
+      superseded: result.superseded ?? false,
+      revision: result.revision,
+      variantKey: result.variantKey ?? null,
+      affectedInstances: result.affectedInstances ?? 0,
+      bindingLayoutChanged: result.bindingLayoutChanged ?? false,
+      bindingLayoutHash: result.bindingLayoutHash ?? null,
+      publishedKept: result.publishedKept ?? null,
+      reason: result.reason ?? null,
+      diagnostic: result.diagnostic ?? null,
+      bindingErrors: result.bindingErrors ?? null,
+    }, null, 2));
+    return;
+  }
+
   console.log(`未知命令: ${cmd}
 可用:
   serve                启动预览服务并打开图形入口（主入口）
   render --out f.png   渲染一帧到 PNG
   bench                固定操作序列：首次卡顿/变体数/复用验证
   prewarm              按预算预热已知场景变体
-  fault                故障注入：验证编译诊断与替代材质`);
+  fault                故障注入：验证编译诊断与替代材质
+  hot-swap [--body tint|broken|rebind]  辅助验证运行中着色器热换`);
   process.exitCode = 1;
 }
 

@@ -211,7 +211,11 @@ export class Compiler {
     out.push('  };');
     out.push('}');
 
-    return { js: out.join('\n'), uniformNames: this.collectUniforms() };
+    return {
+      js: out.join('\n'),
+      uniformNames: this.collectUniforms(),
+      interface: this.collectInterface(),
+    };
   }
 
   collectUniforms() {
@@ -222,6 +226,27 @@ export class Compiler {
       }
     }
     return names;
+  }
+
+  // 阶段接口：热换候选的链接一致性与资源绑定布局都基于这份真实声明生成。
+  collectInterface() {
+    const attributes = [];
+    const inputs = [];
+    const outputs = [];
+    const uniforms = [];
+    for (const d of this.ast.declarations) {
+      if (d.kind !== 'vardecl') continue;
+      for (const v of d.decls) {
+        const entry = { name: v.name, type: d.type.name };
+        if (d.qualifiers.includes('uniform')) uniforms.push(entry);
+        if (d.qualifiers.includes('in')) {
+          if (this.stage === 'vertex') attributes.push(entry);
+          else inputs.push(entry);
+        }
+        if (d.qualifiers.includes('out')) outputs.push(entry);
+      }
+    }
+    return { attributes, inputs, outputs, uniforms };
   }
 
   // ---------- 函数生成 ----------

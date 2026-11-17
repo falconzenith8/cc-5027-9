@@ -2,12 +2,13 @@
 // 负责：变体申请与当前/等待状态、uniform 实时更新（不重编译）、
 // 场景流送（逐帧渲染 PNG）、预热编排、固定操作序列基准测量与重复进入复用验证。
 import { PipelineManager } from './pipeline-manager.js';
+import { HotSwapService } from './hot-swap.js';
 import { SoftwareRenderer } from '../render/renderer.js';
 import { createMesh, MESH_NAMES } from '../render/meshes.js';
 import { buildTextureSet, TEXTURE_KINDS } from '../render/textures.js';
 import { encodePNG } from '../render/png.js';
 import {
-  NUMERIC_PARAMS, STRUCT_FIELDS, ENGINE_UNIFORMS,
+  NUMERIC_PARAMS, STRUCT_FIELDS, ENGINE_UNIFORMS, FRAGMENT_SHADER,
 } from '../shader/material-templates.js';
 import { Mat4, Vec3, Vec4, perspective, lookAt, rotateY, rotateX } from '../shader/value-types.js';
 
@@ -33,6 +34,7 @@ export function createMaterialRecord(partial = {}) {
     },
     params: { ...defaultNumericParams(), ...(partial.params ?? {}) },
     textureKind: partial.textureKind ?? 'checker',
+    shaderProgramId: partial.shaderProgramId ?? null,
   };
 }
 
@@ -54,6 +56,14 @@ export class PreviewSceneService {
     this.lightColor = new Vec3(1.0, 0.97, 0.92);
     this.eventLog = [];
     this._frameSeq = 0;
+
+    // 热换：每份材质所属的着色器程序与"实例"引用（渲染器从实例取已发布变体）
+    this.hotSwap = new HotSwapService(this.pipeline, {
+      getInstances: (programId) => [...this.materials.values()]
+        .filter((m) => m.shaderProgramId === programId)
+        .map((m) => m.shaderInstance),
+    });
+    this._programByMaterial = new Map();
 
     // 预置三份材质，覆盖不同结构组合
     this.registerMaterial(createMaterialRecord({
@@ -82,6 +92,19 @@ export class PreviewSceneService {
   }
 
   registerMaterial(record) {
+    if (!record.shaderProgramId) {
+      const program = this.hotSwap.createProgram({
+        fragmentSource: FRAGMENT_SHADER,
+        struct: record.struct,
+        defines: {
+          NORMAL_MAP: record.struct.NORMAL_MAP,
+          BLEND_MODE: record.struct.BLEND_MODE,
+          LIGHTING: record.struct.LIGHTING,
+        },
+      });
+      record.shaderProgramId = program.id;
+    }
+    record.shaderInstance = record.shaderInstance ?? { variant: null, programId: record.shaderProgramId };
     this.materials.set(record.id, record);
     return record;
   }
@@ -115,6 +138,12 @@ export class PreviewSceneService {
     }
     if (m.struct[field] === v) return this.describeState();
     m.struct[field] = v;
+    // 结构宏变化也同步到材质的着色器程序，之后热换候选沿用同一套结构开关。
+    if (m.shaderProgramId) {
+      const program = this.hotSwap.getProgram(m.shaderProgramId);
+      program.struct = { ...program.struct, [field]: v };
+      program.defines = { ...program.defines, [field]: v };
+    }
     this.eventLog.push({ type: 'struct-change', field, value, at: performance.now() });
     await this.requestVariant(m, `struct:${field}`);
     return this.describeState();
@@ -153,26 +182,71 @@ export class PreviewSceneService {
   // 申请变体：记录"等待中"，编译完成后切换；失败则挂替代材质并保留诊断
   async requestVariant(material, reason) {
     const requestedAt = performance.now();
+    const program = material.shaderProgramId ? this.hotSwap.getProgram(material.shaderProgramId) : null;
+    const isCustom = !!(program && program.fragmentSource !== FRAGMENT_SHADER);
+
+    // 已有自定义源码、且不是结构变更：直接采用程序已发布的变体，不能用模板覆盖它
+    if (isCustom && !reason.startsWith('struct:')) {
+      if (program.published.status === 'ok' && program.published.variant) {
+        const variant = program.published.variant;
+        material.shaderInstance.variant = variant;
+        this.activeVariant = variant;
+        this.activeVariantOfMaterial = material.id;
+        this.activeFallback = false;
+        this.lastCompileResult = {
+          status: 'ok', fromCache: true, compileMs: null, reason: null, identity: variant.identity,
+        };
+        return { status: 'ok', variant, identity: variant.identity, fromCache: true };
+      }
+    }
+
+    // 自定义源码遇结构变更：用新的 defines 重新编译同一份源码，失败保留旧版本
+    if (isCustom && reason.startsWith('struct:')) {
+      this.pending = { materialId: material.id, struct: { ...material.struct }, requestedAt };
+      const task = this.hotSwap.submitCandidate(program.id, {});
+      const result = await this.hotSwap.runCandidate(task);
+      this.pending = null;
+      if (result.adopted) {
+        const variant = program.published.variant;
+        this.activeVariant = variant;
+        this.activeVariantOfMaterial = material.id;
+        this.activeFallback = false;
+        this.lastCompileResult = {
+          status: 'ok', fromCache: !!result.fromCache, compileMs: result.compileMs ?? null,
+          reason: null, identity: variant.identity,
+        };
+        return { status: 'ok', variant, identity: variant.identity, fromCache: !!result.fromCache };
+      }
+      // 失败：保留先前可运行版本；不让旧管线伪装成新结构效果
+      this.lastFailure = {
+        reason: result.reason, diagnostic: result.diagnostic ?? null,
+        bindingErrors: result.bindingErrors ?? null, at: performance.now(),
+      };
+      this.lastCompileResult = {
+        status: 'rejected', fromCache: false, compileMs: null, reason: result.reason, identity: null,
+      };
+      return { status: 'rejected', reason: result.reason, diagnostic: result.diagnostic, fromCache: false, identity: null };
+    }
+
     this.pending = { materialId: material.id, struct: { ...material.struct }, requestedAt };
     const result = await this.pipeline.getOrCreateVariant(material.struct, { reason });
-    // 期间用户又改了选项：以最新申请为准，本次结果不覆盖
-    if (this.pending && this.pending.materialId === material.id
-      && JSON.stringify(this.pending.struct) !== JSON.stringify(material.struct)
-      && reason !== 'select') {
-      // 结构已继续变化，结果仍进入缓存可被后续命中
-    }
     this.pending = null;
     if (result.status === 'ok') {
       this.activeVariant = result.variant;
       this.activeVariantOfMaterial = material.id;
       this.activeFallback = false;
+      if (program) this.hotSwap.notePublished(program.id, result.variant);
     } else {
       // 失败：明确挂替代材质，绝不让旧管线伪装成新效果
       this.activeVariant = result.fallback;
       this.activeVariantOfMaterial = material.id;
       this.activeFallback = true;
       this.lastFailure = { reason: result.reason, diagnostic: result.diagnostic, at: performance.now() };
+      if (program) this.hotSwap.noteFailed(program.id, result.diagnostic);
     }
+    // 材质实例采用该变体（与热换共享同一个实例字段，渲染只认实例上的已发布变体）
+    material.shaderInstance.variant = this.activeVariant;
+    material.shaderInstance.struct = { ...material.struct };
     this.lastCompileResult = {
       status: result.status,
       fromCache: result.fromCache ?? false,
@@ -187,6 +261,102 @@ export class PreviewSceneService {
   prewarm(needed, budget) {
     const list = needed ?? [...this.materials.values()].map((m) => m.struct);
     return this.pipeline.prewarm(list, budget);
+  }
+
+  // ---- 运行中着色器热换 ----
+
+  // 同步受理候选源码（编辑文本已保存），编译在后台进行，不会立刻改变画面。
+  submitShaderCandidate(fragmentSource, options = {}) {
+    const material = this.getMaterial(options.materialId ?? this.currentMaterialId);
+    const programId = material.shaderProgramId;
+    const task = this.hotSwap.submitCandidate(programId, {
+      fragmentSource,
+      editVersion: options.editVersion,
+    });
+    this.eventLog.push({
+      type: 'shader-candidate-submitted', materialId: material.id,
+      programId, revision: task.revision, at: performance.now(),
+    });
+    // 候选提交只代表文本已保存；画面仍由已发布变体渲染，直到 runShaderCandidate 成功发布。
+    return {
+      accepted: true,
+      materialId: material.id,
+      programId,
+      revision: task.revision,
+      editVersion: task.editVersion,
+      // 关键区分：文本保存 ≠ 画面已更新
+      editorTextSaved: true,
+      publishedRevision: this.hotSwap.getProgram(programId).published.revision,
+      activeVariantKey: material.shaderInstance.variant?.key ?? null,
+      task,
+    };
+  }
+
+  // 运行已受理的候选任务，成功则切换所有受影响实例；失败保留先前可运行版本。
+  async runShaderCandidate(task, options = {}) {
+    const result = await this.hotSwap.runCandidate(task);
+    if (result.adopted) {
+      const program = this.hotSwap.getProgram(task.programId);
+      this.activeVariant = program.published.variant;
+      this.activeVariantOfMaterial = this._materialIdOfProgram(task.programId);
+      this.activeFallback = false;
+      this.lastCompileResult = {
+        status: 'ok',
+        fromCache: !!result.fromCache,
+        compileMs: result.compileMs ?? null,
+        reason: null,
+        identity: program.published.variant.identity,
+      };
+    } else if (!result.superseded) {
+      // 保留旧版本运行：activeVariant 不改变；只记录候选失败原因。
+      this.lastFailure = {
+        reason: result.reason,
+        diagnostic: result.diagnostic ?? null,
+        bindingErrors: result.bindingErrors ?? null,
+        at: performance.now(),
+      };
+    }
+    this.eventLog.push({
+      type: result.adopted ? 'shader-candidate-published' : result.superseded ? 'shader-candidate-superseded' : 'shader-candidate-rejected',
+      programId: task.programId, revision: task.revision, at: performance.now(),
+    });
+    void options;
+    return result;
+  }
+
+  // 一步完成：提交 + 编译 + 条件发布。返回结果明确 adopted / 具体失败原因。
+  async hotSwapShader(fragmentSource, options = {}) {
+    const task = this.submitShaderCandidate(fragmentSource, options).task;
+    return this.runShaderCandidate(task, options);
+  }
+
+  shaderProgramState(materialId = this.currentMaterialId) {
+    const material = this.getMaterial(materialId);
+    return this.hotSwap.describeProgram(material.shaderProgramId);
+  }
+
+  rollbackShader(materialId = this.currentMaterialId) {
+    const material = this.getMaterial(materialId);
+    const r = this.hotSwap.rollback(material.shaderProgramId);
+    if (r.rolledBack && r.variant) {
+      material.shaderInstance.variant = r.variant;
+      if (material.id === this.currentMaterialId) {
+        this.activeVariant = r.variant;
+        this.activeVariantOfMaterial = material.id;
+        this.activeFallback = !!r.variant.isFallback;
+        this.lastCompileResult = {
+          status: 'ok', fromCache: true, compileMs: null, reason: null, identity: r.variant.identity,
+        };
+      }
+    }
+    return r;
+  }
+
+  _materialIdOfProgram(programId) {
+    for (const m of this.materials.values()) {
+      if (m.shaderProgramId === programId) return m.id;
+    }
+    return null;
   }
 
   buildUniforms(material) {
@@ -209,7 +379,9 @@ export class PreviewSceneService {
   renderFrame(options = {}) {
     const material = this.getMaterial(this.currentMaterialId);
     const mesh = this.meshes.get(options.mesh ?? material.mesh ?? 'sphere');
-    const variant = this.activeVariant;
+    // 渲染只采用"已发布"变体：热换候选未切换前，画面仍是上一份可运行版本。
+    const instance = material.shaderInstance;
+    const variant = instance?.variant ?? this.activeVariant;
     if (!variant) throw new Error('没有可用管线变体');
 
     const textures = this.getTextures(material.textureKind);
@@ -217,7 +389,14 @@ export class PreviewSceneService {
       u_baseColorTex: textures.albedo,
       u_occlusionTex: textures.occlusion,
     };
-    if (material.struct.NORMAL_MAP) samplers.u_normalTex = textures.normal;
+    // 采样器绑定按管线的真实绑定布局准备；新布局需要新绑定组，不复用旧组。
+    const requiredSamplers = variant.bindingLayout?.samplers?.map((s) => s.name)
+      ?? ['u_baseColorTex', 'u_occlusionTex'];
+    for (const name of requiredSamplers) {
+      if (name === 'u_normalTex') samplers[name] = textures.normal;
+      else if (name === 'u_baseColorTex') samplers[name] = textures.albedo;
+      else if (name === 'u_occlusionTex') samplers[name] = textures.occlusion;
+    }
 
     const w = options.width ?? this.renderer.width;
     const h = options.height ?? this.renderer.height;
@@ -237,12 +416,19 @@ export class PreviewSceneService {
     const normalMat = model.normalMatrix();
 
     const uniforms = this.buildUniforms(material);
-    const t0 = performance.now();
-    this.renderer.render({
-      variant, mesh, uniforms, samplers,
-      modelMatrix: model, viewProjMatrix: viewProj, normalMatrix: normalMat,
-    });
-    const renderMs = performance.now() - t0;
+    // 在途帧持有引用；热换期间被替换的旧管线不会在此之前回收
+    this.pipeline.acquireVariant(variant);
+    let renderMs;
+    try {
+      const t0 = performance.now();
+      this.renderer.render({
+        variant, mesh, uniforms, samplers,
+        modelMatrix: model, viewProjMatrix: viewProj, normalMatrix: normalMat,
+      });
+      renderMs = performance.now() - t0;
+    } finally {
+      this.pipeline.releaseVariant(variant);
+    }
 
     const bytes = this.renderer.toByteFrame();
     const frame = {
@@ -252,6 +438,7 @@ export class PreviewSceneService {
       renderMs,
       variantKey: variant.key,
       isFallback: !!variant.isFallback,
+      bindingLayoutHash: variant.bindingLayout?.hash ?? null,
       materialId: material.id,
       struct: { ...material.struct },
     };
@@ -261,18 +448,23 @@ export class PreviewSceneService {
 
   describeState() {
     const material = this.getMaterial(this.currentMaterialId);
+    const programId = material.shaderProgramId;
     return {
       currentMaterial: {
         id: material.id, name: material.name,
         struct: material.struct, params: material.params, textureKind: material.textureKind,
+        shaderProgramId: programId,
       },
       activeVariant: this.activeVariant ? {
         key: this.activeVariant.key,
         isFallback: !!this.activeVariant.isFallback,
         targetState: this.activeVariant.targetState,
         uniformLayout: this.activeVariant.uniformLayout,
+        bindingLayoutHash: this.activeVariant.bindingLayout?.hash ?? null,
         ofMaterial: this.activeVariantOfMaterial,
       } : null,
+      shaderProgram: programId ? this.hotSwap.describeProgram(programId) : null,
+      hotSwap: this.hotSwap.stats(),
       pending: this.pending,
       lastCompile: this.lastCompileResult ?? null,
       lastFailure: this.lastFailure ?? null,
