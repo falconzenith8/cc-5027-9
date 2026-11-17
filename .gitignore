@@ -23,3 +23,7 @@ __pycache__/
 *.log
 .env
 .env.*
+
+# Material preview CLI generated frames
+/material-preview/preview-frame.png
+/material-preview/frame.png

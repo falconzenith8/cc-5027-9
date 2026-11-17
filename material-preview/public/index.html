@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>材质设计预览 · 着色器变体工作台</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◆</span>
+    <div>
+      <h1>材质设计预览</h1>
+      <p>真实 GLSL 编译管线 · 变体缓存 · 软件光栅化实际运算</p>
+    </div>
+  </div>
+  <div class="top-status" id="globalStatus">
+    <span class="dot" id="globalDot"></span>
+    <span id="globalText">初始化中…</span>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左：材质与结构选项（影响编译） -->
+  <section class="panel">
+    <h2>材质 <small>切换会申请管线变体</small></h2>
+    <div class="material-list" id="materialList"></div>
+    <button class="btn ghost" id="newMaterialBtn">新建材质（复制当前结构）</button>
+
+    <h2 class="section-struct">结构选项 <span class="tag danger">影响编译结构</span></h2>
+    <p class="hint">改动会改变预处理源码与管线目标状态，产生新的变体身份并走真实编译。</p>
+    <div id="structControls"></div>
+
+    <h2>纹理集 <span class="tag">采样器绑定</span></h2>
+    <div class="row" id="textureControls"></div>
+
+    <h2>模型</h2>
+    <div class="row" id="meshControls"></div>
+  </section>
+
+  <!-- 中：流送视窗 -->
+  <section class="panel viewport-panel">
+    <div class="viewport-head">
+      <h2>场景流送视窗</h2>
+      <div class="viewport-meta">
+        <span id="frameMeta">—</span>
+      </div>
+    </div>
+    <div class="viewport-wrap">
+      <img id="viewport" alt="材质预览画面" width="256" height="256">
+      <div class="fallback-banner hidden" id="fallbackBanner">
+        ⚠ 编译失败：当前显示替代材质（品红棋盘），新效果未生效
+      </div>
+    </div>
+    <div class="viewport-actions">
+      <button class="btn primary" id="renderBtn">触发编译并渲染</button>
+      <button class="btn" id="autoRotateBtn">自动旋转：关</button>
+      <label class="inline">分辨率
+        <select id="resolutionSelect">
+          <option value="160">160²</option>
+          <option value="256" selected>256²</option>
+          <option value="320">320²</option>
+        </select>
+      </label>
+    </div>
+
+    <h2>光照（数值参数，不重编译）</h2>
+    <div class="row camera-row">
+      <label>方位角 <input type="range" id="yaw" min="-3.14" max="3.14" step="0.01" value="0.7"></label>
+      <label>俯仰角 <input type="range" id="pitch" min="-1.2" max="1.2" step="0.01" value="0.35"></label>
+    </div>
+  </section>
+
+  <!-- 右：数值参数 + 编译状态 -->
+  <section class="panel">
+    <h2>数值参数 <span class="tag ok">仅更新 Uniform</span></h2>
+    <p class="hint">粗糙度等数值改动只写 uniform 并重新出帧，<b>不会</b>重新编译着色器。</p>
+    <div id="numericControls"></div>
+
+    <h2>编译状态</h2>
+    <div class="compile-card" id="compileCard">
+      <div class="compile-row"><span>状态</span><b id="compileStatus">—</b></div>
+      <div class="compile-row"><span>来源</span><b id="compileSource">—</b></div>
+      <div class="compile-row"><span>编译耗时</span><b id="compileMs">—</b></div>
+      <div class="compile-row key"><span>变体身份</span><code id="variantKey">—</code></div>
+      <div class="compile-row"><span>等待变体</span><b id="pendingState">无</b></div>
+    </div>
+
+    <h2>变体缓存 <small id="cacheCount"></small></h2>
+    <div class="cache-actions">
+      <button class="btn" id="prewarmBtn">按预算预热</button>
+      <button class="btn warn" id="prewarmCancelBtn">取消预热</button>
+      <button class="btn" id="benchBtn">固定序列基准</button>
+      <button class="btn" id="reuseBtn">复用验证</button>
+    </div>
+    <div id="prewarmReport" class="report hidden"></div>
+    <div class="variant-list" id="variantList"></div>
+
+    <h2>故障演练</h2>
+    <p class="hint">注入一段含未声明符号的 GLSL，观察诊断与替代材质路径。</p>
+    <textarea id="faultSource" rows="6" spellcheck="false"></textarea>
+    <button class="btn danger" id="faultBtn">注入故障着色器</button>
+    <div id="faultResult" class="fault-result hidden"></div>
+
+    <h2>编译事件流</h2>
+    <div class="event-log" id="eventLog"></div>
+  </section>
+</main>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

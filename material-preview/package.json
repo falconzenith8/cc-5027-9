@@ -1,0 +1,17 @@
+{
+  "name": "material-preview",
+  "version": "1.0.0",
+  "description": "材质设计预览：真实 GLSL 编译管线、变体缓存、预热预算与软件光栅化渲染",
+  "type": "module",
+  "main": "src/server/main.js",
+  "bin": {
+    "material-preview": "src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js serve",
+    "test": "node tests/run-all.js",
+    "bench": "node src/cli.js bench"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
