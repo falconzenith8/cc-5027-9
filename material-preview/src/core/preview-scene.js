@@ -1,8 +1,7 @@
 // 场景服务：把材质、模型、纹理、管线变体与渲染器串成完整的预览运行时。
 // 负责：变体申请与当前/等待状态、uniform 实时更新（不重编译）、
 // 场景流送（逐帧渲染 PNG）、预热编排、固定操作序列基准测量与重复进入复用验证。
-import { PipelineManager } from './pipeline-manager.js';
-import { HotSwapService } from './hot-swap.js';
+import { PipelineManager, HotSwapStatus } from './pipeline-manager.js';
 import { SoftwareRenderer } from '../render/renderer.js';
 import { createMesh, MESH_NAMES } from '../render/meshes.js';
 import { buildTextureSet, TEXTURE_KINDS } from '../render/textures.js';
@@ -11,8 +10,16 @@ import {
   NUMERIC_PARAMS, STRUCT_FIELDS, ENGINE_UNIFORMS, FRAGMENT_SHADER,
 } from '../shader/material-templates.js';
 import { Mat4, Vec3, Vec4, perspective, lookAt, rotateY, rotateX } from '../shader/value-types.js';
+import {
+  TEMPLATE_SOURCE_ID, validateBindingLayout, diffBindingLayout,
+  prepareBindings, resolveUniformValues,
+} from './bindings.js';
 
 let materialSeq = 0;
+let sourceSeq = 0;
+function nextCustomSourceId(materialId) {
+  return `custom:${materialId}:${++sourceSeq}`;
+}
 
 function defaultNumericParams() {
   const out = {};
@@ -23,6 +30,8 @@ function defaultNumericParams() {
 }
 
 // 一份"材质"= 结构选项（决定变体身份）+ 数值参数（只写 uniform）+ 纹理选择
+// 热换相关字段：publishedShader（已发布源码与编辑版本）、shaderDraft（编辑器草稿）、
+// bindings（按当前管线资源布局准备的绑定组）、hotswap（最近一次热换状态）
 export function createMaterialRecord(partial = {}) {
   return {
     id: `mat-${++materialSeq}`,
@@ -34,7 +43,16 @@ export function createMaterialRecord(partial = {}) {
     },
     params: { ...defaultNumericParams(), ...(partial.params ?? {}) },
     textureKind: partial.textureKind ?? 'checker',
-    shaderProgramId: partial.shaderProgramId ?? null,
+    sourceId: TEMPLATE_SOURCE_ID,
+    publishedShader: {
+      sourceId: TEMPLATE_SOURCE_ID,
+      source: partial.fragmentSource ?? FRAGMENT_SHADER,
+      edition: 0,
+      at: performance.now(),
+    },
+    shaderDraft: { source: partial.fragmentSource ?? FRAGMENT_SHADER, savedAt: performance.now() },
+    bindings: null,
+    hotswap: null,
   };
 }
 
@@ -49,6 +67,8 @@ export class PreviewSceneService {
     // 当前生效的变体（可能是 fallback）；等待中的申请单独记录
     this.activeVariant = null;
     this.activeVariantOfMaterial = null;
+    // 每个材质当前在用的变体 key —— 延迟回收时据此判断旧管线是否仍被引用
+    this.activeVariantByMaterial = new Map();
     this.pending = null; // { materialId, struct, requestedAt }
     this.lastFrame = null;
     this.camera = { distance: 3.2, yaw: 0.7, pitch: 0.35 };
@@ -56,14 +76,6 @@ export class PreviewSceneService {
     this.lightColor = new Vec3(1.0, 0.97, 0.92);
     this.eventLog = [];
     this._frameSeq = 0;
-
-    // 热换：每份材质所属的着色器程序与"实例"引用（渲染器从实例取已发布变体）
-    this.hotSwap = new HotSwapService(this.pipeline, {
-      getInstances: (programId) => [...this.materials.values()]
-        .filter((m) => m.shaderProgramId === programId)
-        .map((m) => m.shaderInstance),
-    });
-    this._programByMaterial = new Map();
 
     // 预置三份材质，覆盖不同结构组合
     this.registerMaterial(createMaterialRecord({
@@ -92,19 +104,6 @@ export class PreviewSceneService {
   }
 
   registerMaterial(record) {
-    if (!record.shaderProgramId) {
-      const program = this.hotSwap.createProgram({
-        fragmentSource: FRAGMENT_SHADER,
-        struct: record.struct,
-        defines: {
-          NORMAL_MAP: record.struct.NORMAL_MAP,
-          BLEND_MODE: record.struct.BLEND_MODE,
-          LIGHTING: record.struct.LIGHTING,
-        },
-      });
-      record.shaderProgramId = program.id;
-    }
-    record.shaderInstance = record.shaderInstance ?? { variant: null, programId: record.shaderProgramId };
     this.materials.set(record.id, record);
     return record;
   }
@@ -126,7 +125,28 @@ export class PreviewSceneService {
     const m = this.getMaterial(id);
     this.currentMaterialId = id;
     this.eventLog.push({ type: 'select', materialId: id, at: performance.now() });
+    // 材质已发布自定义源码：直接复用其热换变体（仍在缓存中），不退回模板管线
+    if (m.sourceId !== TEMPLATE_SOURCE_ID) {
+      return this.#restorePublishedVariant(m);
+    }
     return this.requestVariant(m, 'select');
+  }
+
+  // 重新采用材质已发布的热换变体（场景切回路径）：命中缓存即零重编译
+  async #restorePublishedVariant(material) {
+    const key = this.activeVariantByMaterial.get(material.id);
+    const variant = key ? this.pipeline.cache.get(key) : null;
+    if (variant) {
+      this.#adoptVariant(material, variant);
+      this.activeFallback = false;
+      this.lastCompileResult = {
+        status: 'ok', fromCache: true, compileMs: null, reason: null, identity: variant.identity,
+      };
+      this.eventLog.push({ type: 'hotswap-restore', materialId: material.id, key: variant.key, at: performance.now() });
+      return { status: 'ok', variant, identity: variant.identity, fromCache: true };
+    }
+    // 缓存已被回收等极端情况：按已发布源码重新热换编译
+    return this.applyShaderEdit({ materialId: material.id, source: material.publishedShader.source });
   }
 
   // 结构选项变更：产生新的变体申请（真实编译路径）
@@ -138,14 +158,13 @@ export class PreviewSceneService {
     }
     if (m.struct[field] === v) return this.describeState();
     m.struct[field] = v;
-    // 结构宏变化也同步到材质的着色器程序，之后热换候选沿用同一套结构开关。
-    if (m.shaderProgramId) {
-      const program = this.hotSwap.getProgram(m.shaderProgramId);
-      program.struct = { ...program.struct, [field]: v };
-      program.defines = { ...program.defines, [field]: v };
-    }
     this.eventLog.push({ type: 'struct-change', field, value, at: performance.now() });
-    await this.requestVariant(m, `struct:${field}`);
+    // 材质在用自定义源码：结构变化必须带着新结构重编该源码，而不是退回模板变体
+    if (m.sourceId !== TEMPLATE_SOURCE_ID) {
+      await this.applyShaderEdit({ source: m.publishedShader.source });
+    } else {
+      await this.requestVariant(m, `struct:${field}`);
+    }
     return this.describeState();
   }
 
@@ -182,71 +201,20 @@ export class PreviewSceneService {
   // 申请变体：记录"等待中"，编译完成后切换；失败则挂替代材质并保留诊断
   async requestVariant(material, reason) {
     const requestedAt = performance.now();
-    const program = material.shaderProgramId ? this.hotSwap.getProgram(material.shaderProgramId) : null;
-    const isCustom = !!(program && program.fragmentSource !== FRAGMENT_SHADER);
-
-    // 已有自定义源码、且不是结构变更：直接采用程序已发布的变体，不能用模板覆盖它
-    if (isCustom && !reason.startsWith('struct:')) {
-      if (program.published.status === 'ok' && program.published.variant) {
-        const variant = program.published.variant;
-        material.shaderInstance.variant = variant;
-        this.activeVariant = variant;
-        this.activeVariantOfMaterial = material.id;
-        this.activeFallback = false;
-        this.lastCompileResult = {
-          status: 'ok', fromCache: true, compileMs: null, reason: null, identity: variant.identity,
-        };
-        return { status: 'ok', variant, identity: variant.identity, fromCache: true };
-      }
-    }
-
-    // 自定义源码遇结构变更：用新的 defines 重新编译同一份源码，失败保留旧版本
-    if (isCustom && reason.startsWith('struct:')) {
-      this.pending = { materialId: material.id, struct: { ...material.struct }, requestedAt };
-      const task = this.hotSwap.submitCandidate(program.id, {});
-      const result = await this.hotSwap.runCandidate(task);
-      this.pending = null;
-      if (result.adopted) {
-        const variant = program.published.variant;
-        this.activeVariant = variant;
-        this.activeVariantOfMaterial = material.id;
-        this.activeFallback = false;
-        this.lastCompileResult = {
-          status: 'ok', fromCache: !!result.fromCache, compileMs: result.compileMs ?? null,
-          reason: null, identity: variant.identity,
-        };
-        return { status: 'ok', variant, identity: variant.identity, fromCache: !!result.fromCache };
-      }
-      // 失败：保留先前可运行版本；不让旧管线伪装成新结构效果
-      this.lastFailure = {
-        reason: result.reason, diagnostic: result.diagnostic ?? null,
-        bindingErrors: result.bindingErrors ?? null, at: performance.now(),
-      };
-      this.lastCompileResult = {
-        status: 'rejected', fromCache: false, compileMs: null, reason: result.reason, identity: null,
-      };
-      return { status: 'rejected', reason: result.reason, diagnostic: result.diagnostic, fromCache: false, identity: null };
-    }
-
     this.pending = { materialId: material.id, struct: { ...material.struct }, requestedAt };
     const result = await this.pipeline.getOrCreateVariant(material.struct, { reason });
     this.pending = null;
     if (result.status === 'ok') {
-      this.activeVariant = result.variant;
-      this.activeVariantOfMaterial = material.id;
+      this.#adoptVariant(material, result.variant);
       this.activeFallback = false;
-      if (program) this.hotSwap.notePublished(program.id, result.variant);
     } else {
       // 失败：明确挂替代材质，绝不让旧管线伪装成新效果
       this.activeVariant = result.fallback;
       this.activeVariantOfMaterial = material.id;
+      this.activeVariantByMaterial.set(material.id, result.fallback.key);
       this.activeFallback = true;
       this.lastFailure = { reason: result.reason, diagnostic: result.diagnostic, at: performance.now() };
-      if (program) this.hotSwap.noteFailed(program.id, result.diagnostic);
     }
-    // 材质实例采用该变体（与热换共享同一个实例字段，渲染只认实例上的已发布变体）
-    material.shaderInstance.variant = this.activeVariant;
-    material.shaderInstance.struct = { ...material.struct };
     this.lastCompileResult = {
       status: result.status,
       fromCache: result.fromCache ?? false,
@@ -257,106 +225,213 @@ export class PreviewSceneService {
     return result;
   }
 
+  // 切换到一个已通过编译与绑定检查的变体：先按新管线资源布局准备材料，
+  // 再做单次指针切换；旧管线若被源码更新失效则进入/离开延迟回收。
+  #adoptVariant(material, variant) {
+    const previousKey = this.activeVariantByMaterial.get(material.id) ?? null;
+    const textures = this.getTextures(material.textureKind);
+    material.bindings = prepareBindings({ variant, material, textures });
+    this.activeVariant = variant;
+    this.activeVariantOfMaterial = material.id;
+    this.activeVariantByMaterial.set(material.id, variant.key);
+    // 旧变体若已被源码失效（在 retired 中），现在确认无引用后真正释放
+    if (previousKey && previousKey !== variant.key) {
+      this.pipeline.releaseRetired(this.#allActiveVariantKeys());
+    }
+  }
+
+  #allActiveVariantKeys() {
+    return [...this.activeVariantByMaterial.values(), ...(this.activeVariant ? [this.activeVariant.key] : [])];
+  }
+
+  // 保存编辑器草稿：只更新文本与编辑版本，绝不代表画面已更新
+  saveShaderDraft(source) {
+    if (typeof source !== 'string' || !source.trim()) throw new Error('着色器源码不能为空');
+    const material = this.getMaterial(this.currentMaterialId);
+    material.shaderDraft = { source, savedAt: performance.now() };
+    this.eventLog.push({ type: 'shader-draft-saved', materialId: material.id, at: performance.now() });
+    return this.getShaderState();
+  }
+
+  /**
+   * 运行中热换：候选先编译并检查资源布局，通过后才切换受影响材质。
+   * 编译任务携带编辑版本；连续保存后晚返回的旧结果不覆盖新代码。
+   * 失败保留先前可运行版本，并返回具体原因。
+   */
+  async applyShaderEdit(options = {}) {
+    const material = options.materialId
+      ? this.getMaterial(options.materialId)
+      : this.getMaterial(this.currentMaterialId);
+    const source = options.source ?? material.shaderDraft.source;
+    material.shaderDraft = { source, savedAt: performance.now() };
+
+    // 每次提交单调递增的编辑版本；编译任务携带它做新旧裁决
+    material._nextEdition = (material._nextEdition ?? material.publishedShader.edition ?? 0) + 1;
+    const submittedEdition = material._nextEdition;
+    material.hotswap = {
+      status: 'compiling', submittedEdition,
+      candidateSource: source, startedAt: performance.now(),
+    };
+    this.eventLog.push({
+      type: 'shader-hotswap-start', materialId: material.id,
+      edition: submittedEdition, at: performance.now(),
+    });
+
+    const wasCustom = material.sourceId !== TEMPLATE_SOURCE_ID;
+    // 回退到模板时沿用模板 sourceId（命中静态缓存）；否则为该材质的自定义源码流，
+    // 首次脱离模板时分配独立 sourceId，后续编辑复用同一 sourceId 做相关条目失效
+    const targetSourceId = options.resetToTemplate
+      ? TEMPLATE_SOURCE_ID
+      : (wasCustom ? material.sourceId : nextCustomSourceId(material.id));
+    const request = {
+      fragmentSource: source,
+      struct: { ...material.struct },
+      sourceId: targetSourceId,
+      sourceEdition: submittedEdition,
+      layoutValidator: validateBindingLayout,
+    };
+    // 版本裁决：只有仍是该材质最新提交的任务才允许发布
+    const result = await this.pipeline.compileHotSwap(
+      request,
+      (ed) => material.hotswap?.submittedEdition === ed,
+    );
+
+    // 期间又有新提交：无论成功失败都不得改动已发布状态。
+    // 任务自身的过期结论记录在 lastSettled，材质的 hotswap 仍属于最新任务。
+    if (material.hotswap.submittedEdition !== submittedEdition) {
+      material.lastSettled = {
+        status: 'stale', submittedEdition,
+        finishedAt: performance.now(),
+        reason: `编辑版本 ${submittedEdition} 已过期，结果未发布`,
+      };
+      this.eventLog.push({
+        type: 'shader-hotswap-stale', materialId: material.id,
+        edition: submittedEdition, at: performance.now(),
+      });
+      return { ...this.getShaderState(material.id), hotswap: material.lastSettled };
+    }
+
+    if (result.status === HotSwapStatus.FAILED) {
+      material.hotswap = {
+        ...material.hotswap,
+        status: 'failed', finishedAt: performance.now(),
+        reason: result.reason,
+        diagnostic: result.diagnostic ? {
+          stage: result.diagnostic.stage, phase: result.diagnostic.phase,
+          message: result.diagnostic.message, sourceLine: result.diagnostic.sourceLine,
+        } : null,
+      };
+      this.lastFailure = {
+        reason: result.reason, diagnostic: result.diagnostic, at: performance.now(),
+      };
+      this.eventLog.push({
+        type: 'shader-hotswap-failed', materialId: material.id,
+        edition: submittedEdition, reason: result.reason, at: performance.now(),
+      });
+      // 先前可运行版本原封不动（activeVariant 未被触碰）
+      return this.getShaderState(material.id);
+    }
+
+    if (result.status === HotSwapStatus.REJECTED_STALE) {
+      material.hotswap = {
+        ...material.hotswap, status: 'stale', finishedAt: performance.now(), reason: result.reason,
+      };
+      return this.getShaderState(material.id);
+    }
+
+    // 发布成功。顺序很重要：先为新管线准备材料并切换采用，再失效同源码旧条目 ——
+    // 否则旧 sourceId 的失效会把刚入缓存的新变体一并删掉。
+    const previousLayout = this.activeVariantOfMaterial === material.id && this.activeVariant
+      ? this.activeVariant.uniformLayout
+      : null;
+    const layoutDiff = diffBindingLayout(previousLayout, result.variant.uniformLayout);
+
+    // 为新管线准备对应材料后，单次切换受影响材质（旧绑定组不交给不兼容管线）
+    this.#adoptVariant(material, result.variant);
+    this.activeFallback = false;
+    material.sourceId = request.sourceId;
+    // 切换完成后再失效同一源码的旧缓存条目（其他源码的静态变体缓存继续有效）；
+    // 仍被其他材质引用的旧管线进入延迟回收，无引用的立即释放
+    if (wasCustom) {
+      this.pipeline.invalidateSource(material.sourceId, this.#allActiveVariantKeys(), result.variant.key);
+      this.pipeline.releaseRetired(this.#allActiveVariantKeys());
+    }
+    material.publishedShader = {
+      sourceId: request.sourceId, source,
+      edition: submittedEdition, at: performance.now(),
+    };
+    material.hotswap = {
+      status: 'published', submittedEdition, publishedEdition: submittedEdition,
+      finishedAt: performance.now(), bindingLayout: result.bindingLayout, layoutDiff,
+    };
+    this.lastCompileResult = {
+      status: 'ok', fromCache: result.fromCache ?? false, compileMs: result.variant.compileMs,
+      reason: null, identity: result.identity,
+    };
+    this.eventLog.push({
+      type: 'shader-hotswap-published', materialId: material.id,
+      edition: submittedEdition, key: result.variant.key,
+      layoutChanged: layoutDiff.uniformsAdded.length
+        || layoutDiff.uniformsRemoved.length
+        || layoutDiff.samplersAdded.length
+        || layoutDiff.samplersRemoved.length,
+      at: performance.now(),
+    });
+    return this.getShaderState(material.id);
+  }
+
+  // 回退到模板着色器：同样走"先编译再切换"，不通过重启程序回避生命周期
+  async resetShader() {
+    const material = this.getMaterial(this.currentMaterialId);
+    const customSourceId = material.sourceId;
+    const state = await this.applyShaderEdit({ source: FRAGMENT_SHADER, resetToTemplate: true });
+    // 自定义源码的残留条目现在确定无引用，显式失效并释放
+    if (customSourceId !== TEMPLATE_SOURCE_ID) {
+      this.pipeline.invalidateSource(customSourceId, this.#allActiveVariantKeys());
+      this.pipeline.releaseRetired(this.#allActiveVariantKeys());
+    }
+    return state;
+  }
+
+  // 候选（编辑器草稿）与已发布状态的显式比较：保存成功不等于画面已更新
+  getShaderState(materialId = this.currentMaterialId) {
+    const material = this.getMaterial(materialId);
+    const draftSource = material.shaderDraft?.source ?? material.publishedShader.source;
+    const published = material.publishedShader;
+    const activeVariant = this.activeVariantOfMaterial === material.id ? this.activeVariant : null;
+    return {
+      materialId: material.id,
+      sourceId: material.sourceId,
+      draft: {
+        source: draftSource,
+        savedAt: material.shaderDraft?.savedAt ?? null,
+        differsFromPublished: draftSource !== published.source,
+      },
+      published: {
+        source: published.source,
+        edition: published.edition,
+        at: published.at,
+        variantKey: activeVariant?.key ?? null,
+        uniformLayout: activeVariant?.uniformLayout ?? null,
+      },
+      hotswap: material.hotswap ? {
+        status: material.hotswap.status,
+        submittedEdition: material.hotswap.submittedEdition,
+        publishedEdition: material.hotswap.publishedEdition ?? published.edition,
+        reason: material.hotswap.reason ?? null,
+        diagnostic: material.hotswap.diagnostic ?? null,
+        layoutDiff: material.hotswap.layoutDiff ?? null,
+      } : null,
+      // 画面是否真的已更新：草稿与已发布源码一致即同步（初始模板也算）；
+      // 草稿一旦偏离已发布（仅保存未编译）则立即失步，直到下次成功热换
+      viewportInSync: draftSource === published.source,
+    };
+  }
+
   // 已知场景需求的预热（默认只预热三份在用材质，而非 18 个全组合）
   prewarm(needed, budget) {
     const list = needed ?? [...this.materials.values()].map((m) => m.struct);
     return this.pipeline.prewarm(list, budget);
-  }
-
-  // ---- 运行中着色器热换 ----
-
-  // 同步受理候选源码（编辑文本已保存），编译在后台进行，不会立刻改变画面。
-  submitShaderCandidate(fragmentSource, options = {}) {
-    const material = this.getMaterial(options.materialId ?? this.currentMaterialId);
-    const programId = material.shaderProgramId;
-    const task = this.hotSwap.submitCandidate(programId, {
-      fragmentSource,
-      editVersion: options.editVersion,
-    });
-    this.eventLog.push({
-      type: 'shader-candidate-submitted', materialId: material.id,
-      programId, revision: task.revision, at: performance.now(),
-    });
-    // 候选提交只代表文本已保存；画面仍由已发布变体渲染，直到 runShaderCandidate 成功发布。
-    return {
-      accepted: true,
-      materialId: material.id,
-      programId,
-      revision: task.revision,
-      editVersion: task.editVersion,
-      // 关键区分：文本保存 ≠ 画面已更新
-      editorTextSaved: true,
-      publishedRevision: this.hotSwap.getProgram(programId).published.revision,
-      activeVariantKey: material.shaderInstance.variant?.key ?? null,
-      task,
-    };
-  }
-
-  // 运行已受理的候选任务，成功则切换所有受影响实例；失败保留先前可运行版本。
-  async runShaderCandidate(task, options = {}) {
-    const result = await this.hotSwap.runCandidate(task);
-    if (result.adopted) {
-      const program = this.hotSwap.getProgram(task.programId);
-      this.activeVariant = program.published.variant;
-      this.activeVariantOfMaterial = this._materialIdOfProgram(task.programId);
-      this.activeFallback = false;
-      this.lastCompileResult = {
-        status: 'ok',
-        fromCache: !!result.fromCache,
-        compileMs: result.compileMs ?? null,
-        reason: null,
-        identity: program.published.variant.identity,
-      };
-    } else if (!result.superseded) {
-      // 保留旧版本运行：activeVariant 不改变；只记录候选失败原因。
-      this.lastFailure = {
-        reason: result.reason,
-        diagnostic: result.diagnostic ?? null,
-        bindingErrors: result.bindingErrors ?? null,
-        at: performance.now(),
-      };
-    }
-    this.eventLog.push({
-      type: result.adopted ? 'shader-candidate-published' : result.superseded ? 'shader-candidate-superseded' : 'shader-candidate-rejected',
-      programId: task.programId, revision: task.revision, at: performance.now(),
-    });
-    void options;
-    return result;
-  }
-
-  // 一步完成：提交 + 编译 + 条件发布。返回结果明确 adopted / 具体失败原因。
-  async hotSwapShader(fragmentSource, options = {}) {
-    const task = this.submitShaderCandidate(fragmentSource, options).task;
-    return this.runShaderCandidate(task, options);
-  }
-
-  shaderProgramState(materialId = this.currentMaterialId) {
-    const material = this.getMaterial(materialId);
-    return this.hotSwap.describeProgram(material.shaderProgramId);
-  }
-
-  rollbackShader(materialId = this.currentMaterialId) {
-    const material = this.getMaterial(materialId);
-    const r = this.hotSwap.rollback(material.shaderProgramId);
-    if (r.rolledBack && r.variant) {
-      material.shaderInstance.variant = r.variant;
-      if (material.id === this.currentMaterialId) {
-        this.activeVariant = r.variant;
-        this.activeVariantOfMaterial = material.id;
-        this.activeFallback = !!r.variant.isFallback;
-        this.lastCompileResult = {
-          status: 'ok', fromCache: true, compileMs: null, reason: null, identity: r.variant.identity,
-        };
-      }
-    }
-    return r;
-  }
-
-  _materialIdOfProgram(programId) {
-    for (const m of this.materials.values()) {
-      if (m.shaderProgramId === programId) return m.id;
-    }
-    return null;
   }
 
   buildUniforms(material) {
@@ -365,6 +440,8 @@ export class PreviewSceneService {
       const raw = material.params[name] ?? spec.default;
       u[name] = spec.type === 'vec4' ? new Vec4(...raw) : raw;
     }
+    // 热换引入的材质 uniform（模板参数表之外）：按准备好的绑定组取值
+    Object.assign(u, resolveUniformValues(material));
     const eye = new Vec3(
       this.camera.distance * Math.cos(this.camera.pitch) * Math.sin(this.camera.yaw),
       this.camera.distance * Math.sin(this.camera.pitch),
@@ -379,24 +456,17 @@ export class PreviewSceneService {
   renderFrame(options = {}) {
     const material = this.getMaterial(this.currentMaterialId);
     const mesh = this.meshes.get(options.mesh ?? material.mesh ?? 'sphere');
-    // 渲染只采用"已发布"变体：热换候选未切换前，画面仍是上一份可运行版本。
-    const instance = material.shaderInstance;
-    const variant = instance?.variant ?? this.activeVariant;
+    const variant = this.activeVariant;
     if (!variant) throw new Error('没有可用管线变体');
 
     const textures = this.getTextures(material.textureKind);
-    const samplers = {
+    // 绑定组按当前管线资源布局准备：只交它声明的采样器，
+    // 布局改变后的新管线绝不会收到旧绑定组
+    const samplers = material.bindings?.samplers ?? {
       u_baseColorTex: textures.albedo,
       u_occlusionTex: textures.occlusion,
+      ...(material.struct.NORMAL_MAP ? { u_normalTex: textures.normal } : {}),
     };
-    // 采样器绑定按管线的真实绑定布局准备；新布局需要新绑定组，不复用旧组。
-    const requiredSamplers = variant.bindingLayout?.samplers?.map((s) => s.name)
-      ?? ['u_baseColorTex', 'u_occlusionTex'];
-    for (const name of requiredSamplers) {
-      if (name === 'u_normalTex') samplers[name] = textures.normal;
-      else if (name === 'u_baseColorTex') samplers[name] = textures.albedo;
-      else if (name === 'u_occlusionTex') samplers[name] = textures.occlusion;
-    }
 
     const w = options.width ?? this.renderer.width;
     const h = options.height ?? this.renderer.height;
@@ -416,19 +486,12 @@ export class PreviewSceneService {
     const normalMat = model.normalMatrix();
 
     const uniforms = this.buildUniforms(material);
-    // 在途帧持有引用；热换期间被替换的旧管线不会在此之前回收
-    this.pipeline.acquireVariant(variant);
-    let renderMs;
-    try {
-      const t0 = performance.now();
-      this.renderer.render({
-        variant, mesh, uniforms, samplers,
-        modelMatrix: model, viewProjMatrix: viewProj, normalMatrix: normalMat,
-      });
-      renderMs = performance.now() - t0;
-    } finally {
-      this.pipeline.releaseVariant(variant);
-    }
+    const t0 = performance.now();
+    this.renderer.render({
+      variant, mesh, uniforms, samplers,
+      modelMatrix: model, viewProjMatrix: viewProj, normalMatrix: normalMat,
+    });
+    const renderMs = performance.now() - t0;
 
     const bytes = this.renderer.toByteFrame();
     const frame = {
@@ -438,8 +501,9 @@ export class PreviewSceneService {
       renderMs,
       variantKey: variant.key,
       isFallback: !!variant.isFallback,
-      bindingLayoutHash: variant.bindingLayout?.hash ?? null,
       materialId: material.id,
+      sourceId: variant.sourceId,
+      sourceEdition: variant.sourceEdition,
       struct: { ...material.struct },
     };
     this.lastFrame = frame;
@@ -448,23 +512,21 @@ export class PreviewSceneService {
 
   describeState() {
     const material = this.getMaterial(this.currentMaterialId);
-    const programId = material.shaderProgramId;
     return {
       currentMaterial: {
         id: material.id, name: material.name,
         struct: material.struct, params: material.params, textureKind: material.textureKind,
-        shaderProgramId: programId,
       },
       activeVariant: this.activeVariant ? {
         key: this.activeVariant.key,
         isFallback: !!this.activeVariant.isFallback,
         targetState: this.activeVariant.targetState,
         uniformLayout: this.activeVariant.uniformLayout,
-        bindingLayoutHash: this.activeVariant.bindingLayout?.hash ?? null,
         ofMaterial: this.activeVariantOfMaterial,
+        sourceId: this.activeVariant.sourceId,
+        sourceEdition: this.activeVariant.sourceEdition,
       } : null,
-      shaderProgram: programId ? this.hotSwap.describeProgram(programId) : null,
-      hotSwap: this.hotSwap.stats(),
+      shader: this.getShaderState(),
       pending: this.pending,
       lastCompile: this.lastCompileResult ?? null,
       lastFailure: this.lastFailure ?? null,

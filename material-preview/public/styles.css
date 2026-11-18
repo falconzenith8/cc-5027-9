@@ -170,17 +170,22 @@ textarea { width: 100%; font-family: var(--mono); font-size: 12px; resize: verti
 .event-line.compiled b { color: var(--ok); }
 .event-line.cache-hit b { color: var(--accent); }
 
-.shader-actions { margin: 8px 0; }
-.shader-actions .btn { margin-top: 0; }
-.shader-status {
-  background: var(--panel-2); border: 1px solid var(--border);
-  border-radius: 8px; padding: 4px 12px; margin-top: 8px;
+/* 着色器源码热换面板 */
+.hotswap-status { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+.status-pill.stale { background: rgba(224,164,49,.15); color: var(--warn); }
+.status-pill.compiling { background: rgba(79,156,255,.15); color: var(--accent); }
+.status-pill.published { background: rgba(63,185,107,.15); color: var(--ok); }
+.status-pill.failed { background: rgba(229,83,75,.15); color: var(--danger); }
+#hotswapMeta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.shader-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.shader-col { min-width: 0; }
+.shader-label {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; color: var(--muted); margin-bottom: 4px;
 }
-.shader-status .srow {
-  display: flex; justify-content: space-between; gap: 10px;
-  padding: 6px 0; border-bottom: 1px solid var(--border);
-  font-size: 12px; color: var(--muted);
-}
-.shader-status .srow:last-child { border-bottom: 0; }
-.shader-status .srow b { color: var(--text); font-weight: 500; }
-.shader-status .srow code { font-family: var(--mono); font-size: 10px; color: var(--accent); word-break: break-all; text-align: right; }
+.shader-col textarea { height: 320px; font-size: 11px; line-height: 1.45; }
+.shader-col textarea[readonly] { background: #10151c; color: #9aa7b5; }
+.hotswap-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+#hotswapResult { border-color: var(--warn); background: rgba(224,164,49,.08); }
+#hotswapResult.ok { border-color: var(--ok); background: rgba(63,185,107,.08); }
+#hotswapResult.fail { border-color: var(--danger); background: rgba(229,83,75,.1); }

@@ -89,42 +89,30 @@ void main() {
     return;
   }
 
-  // 辅助验证：对当前材质做一次热换（图形界面仍是主入口）
-  if (cmd === 'hot-swap') {
-    const bodyFlag = args.flags.body ?? 'tint';
-    const bodies = {
-      tint: 'vec4 c = texture(u_baseColorTex, v_uv) * u_baseColor;\n  c.rgb = c.rgb * 0.3 + vec3(0.0, 0.5, 0.1);\n  fragColor = vec4(c.rgb, 1.0);',
-      broken: 'vec4 c = tex(u_baseColorTex, v_uv);\n  fragColor = c;',
-      rebind: 'fragColor = texture(u_baseColorTex, v_uv) + vec4(0.0, 0.0, 0.2, 0.0);',
-    };
-    const uniforms = bodyFlag === 'rebind'
-      ? `uniform sampler2D u_baseColorTex;`
-      : `uniform vec4 u_baseColor;\nuniform sampler2D u_baseColorTex;\nuniform sampler2D u_occlusionTex;`;
-    const source = `#version 300 es
-precision highp float;
-in vec3 v_worldPos;
-in vec3 v_normal;
-in vec2 v_uv;
-in vec3 v_tangent;
-${uniforms}
-out vec4 fragColor;
-void main() {
-  ${bodies[bodyFlag] ?? bodies.tint}
-}
-`;
-    const result = await svc.hotSwapShader(source);
+  // 着色器热换（辅助验证；主入口仍是图形界面的"着色器源码热换"面板）
+  if (cmd === 'hotswap') {
+    const { readFile } = await import('node:fs/promises');
+    if (args.flags.material) await svc.selectMaterial(args.flags.material);
+    const candidate = args.flags.file
+      ? await readFile(path.resolve(args.flags.file), 'utf8')
+      : (args.flags.source ?? '');
+    if (!candidate) {
+      console.error('hotswap 需要 --file <源码路径> 或 --source <GLSL 文本>');
+      process.exitCode = 1;
+      return;
+    }
+    const state = await svc.applyShaderEdit({ source: candidate });
+    const frame = svc.renderFrame();
+    const out = args.flags.out ?? path.resolve('hotswap-frame.png');
+    await writeFile(out, frame.png);
     console.log(JSON.stringify({
-      adopted: result.adopted,
-      superseded: result.superseded ?? false,
-      revision: result.revision,
-      variantKey: result.variantKey ?? null,
-      affectedInstances: result.affectedInstances ?? 0,
-      bindingLayoutChanged: result.bindingLayoutChanged ?? false,
-      bindingLayoutHash: result.bindingLayoutHash ?? null,
-      publishedKept: result.publishedKept ?? null,
-      reason: result.reason ?? null,
-      diagnostic: result.diagnostic ?? null,
-      bindingErrors: result.bindingErrors ?? null,
+      hotswap: state.hotswap,
+      viewportInSync: state.viewportInSync,
+      frame: {
+        out, variantKey: frame.variantKey,
+        sourceId: frame.sourceId, sourceEdition: frame.sourceEdition,
+        fallback: frame.isFallback, renderMs: Number(frame.renderMs.toFixed(2)),
+      },
     }, null, 2));
     return;
   }
@@ -136,7 +124,7 @@ void main() {
   bench                固定操作序列：首次卡顿/变体数/复用验证
   prewarm              按预算预热已知场景变体
   fault                故障注入：验证编译诊断与替代材质
-  hot-swap [--body tint|broken|rebind]  辅助验证运行中着色器热换`);
+  hotswap --file f.glsl 着色器源码运行中热换（辅助；主入口在图形界面）`);
   process.exitCode = 1;
 }
 

@@ -4,17 +4,21 @@ import { parse, ParseError } from '../shader/parser.js';
 import { Compiler, SemanticError } from '../shader/compiler.js';
 import {
   VERTEX_SHADER, FRAGMENT_SHADER, VERTEX_LAYOUT, STRUCT_FIELDS,
-  NUMERIC_PARAMS, ENGINE_UNIFORMS,
 } from '../shader/material-templates.js';
-import { buildVariantIdentity, normalizeStruct, targetStateFromStruct, sha256Short, requestFingerprint } from './variant-key.js';
-import { analyzeBindingLayout, defaultUniformProviders, BindingLayoutError } from './binding-layout.js';
+import { buildVariantIdentity, normalizeStruct, targetStateFromStruct, sha256Short } from './variant-key.js';
+import { TEMPLATE_SOURCE_ID, BindingLayoutError } from './bindings.js';
 
 const RUNTIME_URLS = {
   valueTypes: new URL('../shader/value-types.js', import.meta.url).href,
   builtins: new URL('../shader/builtins.js', import.meta.url).href,
 };
 
-export const DEFAULT_SAMPLER_NAMES = ['u_baseColorTex', 'u_occlusionTex', 'u_normalTex'];
+// 热换任务的生命周期状态（测试与事件日志据此核对版本采用情况）
+export const HotSwapStatus = Object.freeze({
+  PUBLISHED: 'published',       // 成功并成为当前材质管线
+  REJECTED_STALE: 'stale',      // 编译成功但编辑版本已过期，不得覆盖新代码
+  FAILED: 'failed',             // 编译/绑定检查失败，先前可运行版本保留
+});
 
 export class CompileDiagnostic extends Error {
   constructor(stage, phase, message, sourceLine) {
@@ -54,17 +58,14 @@ export class PipelineManager {
     this.failures = new Map();    // key -> { diagnostic, struct, at }
     this.compilerLog = [];        // 全部编译事件（成功/失败/缓存命中）
     this.resolver = options.resolver ?? (() => null);
+    // 链接门控：默认真正 import 生成模块；测试可注入以确定性地推迟/放行链接完成
+    this.linkGate = options.linkGate ?? null;
     this.layout = VERTEX_LAYOUT;
-    this.numericParams = options.numericParams ?? NUMERIC_PARAMS;
-    this.engineUniforms = options.engineUniforms ?? ENGINE_UNIFORMS;
-    this.uniformProviders = defaultUniformProviders(this.numericParams, this.engineUniforms);
-    this.resourceProvider = options.resourceProvider ?? ((name) => (
-      DEFAULT_SAMPLER_NAMES.includes(name) ? name : null
-    ));
-    // 延迟回收：仍被 GPU 使用（在途帧里持有）的管线等引用计数归零后再释放。
-    this.retired = new Map();     // key -> { variant, retiredAt, reason }
     this._fallback = null;
     this._fallbackReady = false;
+    // 延迟回收：被源码更新失效、但仍被场景（GPU/渲染帧）引用的旧管线
+    this.retired = new Map();     // key -> { variant, retiredAt, reason }
+    this.inFlight = 0;            // 仍在进行中的链接任务（管线尚未真正释放）
   }
 
   get stats() {
@@ -72,7 +73,8 @@ export class PipelineManager {
       cachedVariants: this.cache.size,
       failedVariants: this.failures.size,
       totalCompileEvents: this.compilerLog.length,
-      retiredPending: this.retired.size,
+      retiredVariants: this.retired.size,
+      inFlightCompiles: this.inFlight,
     };
   }
 
@@ -102,7 +104,6 @@ export class PipelineManager {
     }
     return {
       ...result,
-      interface: result.interface,
       preprocessedSource: pre.code,
       definesUsed: pre.defsUsed,
       includeChain: pre.includeChain,
@@ -112,14 +113,22 @@ export class PipelineManager {
 
   // 链接：用 data URL 真实加载生成的 ES 模块（Node 原生 import），
   // 失败（如生成代码有 bug）同样作为 link 阶段诊断保留。
-  async #link(vertexJs, fragmentJs) {
+  // 链接期间任务计入 inFlight：任务未完成前其模块仍可能被采用，不能回收。
+  async #link(vertexJs, fragmentJs, stage = 'variant') {
     const vUrl = 'data:text/javascript;base64,' + Buffer.from(vertexJs).toString('base64');
     const fUrl = 'data:text/javascript;base64,' + Buffer.from(fragmentJs).toString('base64');
+    this.inFlight++;
     try {
-      const [vMod, fMod] = await Promise.all([import(vUrl), import(fUrl)]);
-      return { vertexModule: vMod, fragmentModule: fMod };
+      const doImport = async () => {
+        const [vMod, fMod] = await Promise.all([import(vUrl), import(fUrl)]);
+        return { vertexModule: vMod, fragmentModule: fMod };
+      };
+      const work = this.linkGate ? this.linkGate(doImport, stage) : doImport();
+      return await work;
     } catch (e) {
       throw new CompileDiagnostic('link', 'link', `生成模块加载失败: ${e.message}`);
+    } finally {
+      this.inFlight--;
     }
   }
 
@@ -168,258 +177,38 @@ export class PipelineManager {
     const started = now();
     try {
       const linked = await this.#link(vCompiled.js, fCompiled.js);
-      const binding = this.#bindingFor(vCompiled, fCompiled);
-      if (!binding.ok) throw new BindingLayoutError(binding.errors);
-      // 静态变体的 key 格式保持不变（初版缓存继续有效）；绑定布局只做校验，
-      // 因为结构宏本身已经唯一决定静态源码。自定义源码变体才把布局并入身份。
       const variant = {
         key: identity.key,
         identity,
         struct,
         targetState: targetStateFromStruct(struct),
         layout: this.layout,
-        bindingLayout: binding.layout,
         vertex: { ...vCompiled, module: linked.vertexModule },
         fragment: { ...fCompiled, module: linked.fragmentModule },
         uniformLayout: [...vCompiled.uniformNames, ...fCompiled.uniformNames],
+        sourceId: TEMPLATE_SOURCE_ID,
+        sourceEdition: 0,
         createdAt: now(),
-        inUse: 0,
         compileMs: now() - started,
       };
-      this.cache.set(variant.key, variant);
+      this.cache.set(identity.key, variant);
       this.failures.delete(identity.key);
       this.compilerLog.push({
-        type: 'compiled', key: variant.key, struct,
+        type: 'compiled', key: identity.key, struct,
         ms: variant.compileMs, at: now(), reason: context.reason ?? 'switch',
       });
       return { status: 'ok', variant, identity, fromCache: false, compileMs: variant.compileMs };
     } catch (e) {
-      return this.#recordFailure(e, identity.key, struct);
-    }
-  }
-
-  #bindingFor(vCompiled, fCompiled) {
-    return analyzeBindingLayout(vCompiled.interface, fCompiled.interface, {
-      vertexLayout: this.layout,
-      uniformProviders: this.uniformProviders,
-      resourceProvider: this.resourceProvider,
-      requireFragmentOutput: true,
-    });
-  }
-
-  /**
-   * 编译一段候选源码（热换用）。与 getOrCreateVariant 的差别：
-   *  - 不直接写入已发布缓存，调用方确认后才 adopt；
-   *  - 身份同时含源码哈希与资源绑定布局哈希；
-   *  - 绑定布局不可用时返回 binding 阶段诊断，绝不产出可切换管线。
-   */
-  async compileSource(source, options = {}) {
-    const {
-      vertexSource = VERTEX_SHADER,
-      fragmentSource = source,
-      defines = {},
-      struct = {},
-      stage = 'custom',
-      programId = null,
-      reason = 'hot-swap',
-    } = options;
-    if (typeof fragmentSource !== 'string' || !fragmentSource.trim()) {
-      return {
-        status: 'failed',
-        diagnostic: new CompileDiagnostic('fragment', 'parse', '片元着色器源码为空'),
-        bindingErrors: null,
-      };
-    }
-
-    const started = now();
-    let vCompiled; let fCompiled;
-    try {
-      vCompiled = this.#compileStage('vertex', vertexSource, defines);
-      fCompiled = this.#compileStage('fragment', fragmentSource, defines);
-    } catch (e) {
-      return this.#failedCandidate(e, struct);
-    }
-
-    const binding = this.#bindingFor(vCompiled, fCompiled);
-    if (!binding.ok) {
-      const err = new BindingLayoutError(binding.errors);
-      return this.#failedCandidate(err, struct);
-    }
-
-    // 自定义源码本身不含宏，但预处理宏与目标状态仍会影响实际管线；
-    // 把结构/宏并入身份，结构切换必须得到不同变体，不能复用旧 key。
-    const identityStruct = stage === 'custom' ? { ...struct, __defines: defines } : struct;
-    const identity = buildVariantIdentity({
-      vertexSource: vCompiled.preprocessedSource,
-      fragmentSource: fCompiled.preprocessedSource,
-      layout: this.layout,
-      struct: identityStruct,
-      stage,
-      bindingLayoutHash: binding.layout.hash,
-    });
-
-    const hit = this.cache.get(identity.key);
-    if (hit) {
-      this.compilerLog.push({ type: 'cache-hit', key: identity.key, struct, at: now(), reason });
-      return {
-        status: 'ok', variant: hit, identity, fromCache: true,
-        bindingLayout: binding.layout,
-      };
-    }
-
-    let linked;
-    try {
-      linked = await this.#link(vCompiled.js, fCompiled.js);
-    } catch (e) {
-      return this.#failedCandidate(e, struct);
-    }
-
-    const variant = {
-      key: identity.key,
-      identity,
-      struct,
-      stage,
-      programId,
-      sourceHash: requestFingerprint(fragmentSource, defines),
-      variantSourceText: fragmentSource,
-      targetState: targetStateFromStruct(struct),
-      layout: this.layout,
-      bindingLayout: binding.layout,
-      vertex: { ...vCompiled, module: linked.vertexModule },
-      fragment: { ...fCompiled, module: linked.fragmentModule },
-      uniformLayout: [...vCompiled.uniformNames, ...fCompiled.uniformNames],
-      createdAt: now(),
-      inUse: 0,
-      compileMs: now() - started,
-    };
-    this.compilerLog.push({
-      type: 'candidate-compiled', key: variant.key, struct,
-      ms: variant.compileMs, at: now(), reason,
-    });
-    return {
-      status: 'ok', variant, identity, fromCache: false,
-      compileMs: variant.compileMs, bindingLayout: binding.layout,
-    };
-  }
-
-  async #failedCandidate(error, struct) {
-    const diagnostic = error instanceof CompileDiagnostic ? error
-      : error instanceof BindingLayoutError
-        ? new CompileDiagnostic('fragment', 'binding', error.message)
-        : new CompileDiagnostic('fragment', 'link', String(error?.message ?? error));
-    this.compilerLog.push({
-      type: 'candidate-failed', error: diagnostic.message,
-      phase: diagnostic.phase, at: now(),
-    });
-    return {
-      status: 'failed',
-      diagnostic,
-      bindingErrors: error instanceof BindingLayoutError ? error.errors : null,
-    };
-  }
-
-  // 候选通过检查后才进入已发布缓存，供后续同源码帧直接复用
-  adoptVariant(variant) {
-    if (!variant || this.cache.has(variant.key)) return variant;
-    variant.inUse = variant.inUse ?? 0;
-    this.cache.set(variant.key, variant);
-    this.failures.delete(variant.key);
-    return variant;
-  }
-
-  // ---- 管线生命周期：引用计数 + 延迟回收 ----
-  // 一帧在途渲染会 acquire；热换发布后旧管线进入 retired，等最后一个使用者
-  // release 之后才真正释放，绝不提前回收仍在 GPU 侧使用的资源。
-  acquireVariant(variant) {
-    if (!variant) return null;
-    variant.inUse = (variant.inUse ?? 0) + 1;
-    return variant;
-  }
-
-  releaseVariant(variant) {
-    if (!variant) return { released: false };
-    variant.inUse = Math.max(0, (variant.inUse ?? 0) - 1);
-    if (variant.inUse === 0 && this.retired.has(variant.key)) {
-      return this.#finalizeRetired(variant.key, 'last-user-released');
-    }
-    return { released: false, inUse: variant.inUse };
-  }
-
-  retireVariant(variant, reason = 'superseded') {
-    if (!variant) return { released: false };
-    // 静态变体（初版缓存）不属于热换替换对象，保留缓存供结构切换复用。
-    if (variant.identity?.stage === 'graphics' || variant.isFallback) {
-      return { released: false, preserved: true };
-    }
-    if (variant.inUse > 0) {
-      this.retired.set(variant.key, { variant, reason, retiredAt: now(), inUse: variant.inUse });
+      const diagnostic = e instanceof CompileDiagnostic ? e
+        : new CompileDiagnostic('fragment', 'link', String(e?.message ?? e));
+      this.failures.set(identity.key, { diagnostic, struct, at: now(), sourceKey: identity.key });
       this.compilerLog.push({
-        type: 'retire-deferred', key: variant.key, reason, inUse: variant.inUse, at: now(),
+        type: 'failed', key: identity.key, struct,
+        error: diagnostic.message, phase: diagnostic.phase, at: now(),
       });
-      return { released: false, deferred: true, inUse: variant.inUse };
+      const fallback = await this.#getFallback();
+      return { status: 'fallback', fallback, identity, reason: diagnostic.message, diagnostic };
     }
-    return this.#finalizeRetired(variant.key, reason, variant);
-  }
-
-  #finalizeRetired(key, reason, knownVariant = null) {
-    const entry = this.retired.get(key);
-    const variant = knownVariant ?? entry?.variant ?? null;
-    this.retired.delete(key);
-    if (variant && variant.identity?.stage !== 'graphics') this.cache.delete(key);
-    this.compilerLog.push({ type: 'retired', key, reason, at: now() });
-    return { released: true, deferred: false, reason };
-  }
-
-  // 定向失效：源码更新只清除相关条目，初版静态变体（stage='graphics'）继续有效。
-  // 仍被在途帧引用的旧管线不硬删，转入 retired 等最后一个使用者释放后回收。
-  invalidateSourceEntries(predicate) {
-    const removed = [];
-    const deferred = [];
-    for (const [key, variant] of [...this.cache.entries()]) {
-      if (!predicate(variant)) continue;
-      if ((variant.inUse ?? 0) > 0) {
-        this.retired.set(key, {
-          variant, reason: 'source-invalidated', retiredAt: now(), inUse: variant.inUse,
-        });
-        deferred.push(key);
-        this.compilerLog.push({ type: 'retire-deferred', key, reason: 'source-invalidated', inUse: variant.inUse, at: now() });
-      } else {
-        this.cache.delete(key);
-        removed.push(key);
-      }
-    }
-    for (const [key, failure] of [...this.failures.entries()]) {
-      if (predicate({ key, struct: failure.struct, programId: failure.programId })) {
-        this.failures.delete(key);
-      }
-    }
-    if (removed.length || deferred.length) {
-      this.compilerLog.push({ type: 'invalidate', keys: removed, deferred, at: now() });
-    }
-    return { removed, deferred };
-  }
-
-  #recordFailure(error, key, struct) {
-    const diagnostic = error instanceof CompileDiagnostic ? error
-      : error instanceof BindingLayoutError
-        ? new CompileDiagnostic(error.errors[0]?.code === 'MISSING_RESOURCE' ? 'fragment' : 'link',
-          'binding', error.message)
-        : new CompileDiagnostic('fragment', 'link', String(error?.message ?? error));
-    const record = {
-      diagnostic,
-      struct,
-      at: now(),
-      sourceKey: key,
-      bindingErrors: error instanceof BindingLayoutError ? error.errors : null,
-    };
-    this.failures.set(key, record);
-    this.compilerLog.push({
-      type: 'failed', key, struct,
-      error: diagnostic.message, phase: diagnostic.phase, at: now(),
-    });
-    return this.#getFallback().then((fallback) => ({
-      status: 'fallback', fallback, identity: { key }, reason: diagnostic.message, diagnostic, bindingErrors: record.bindingErrors,
-    }));
   }
 
   // 替代材质独立编译；它若也失败则返回硬失败（调用方必须显式处理，不能静默用旧管线）
@@ -444,6 +233,8 @@ export class PipelineManager {
       vertex: { ...vCompiled, module: linked.vertexModule },
       fragment: { ...fCompiled, module: linked.fragmentModule },
       uniformLayout: [...vCompiled.uniformNames, ...fCompiled.uniformNames],
+      sourceId: 'builtin:fallback',
+      sourceEdition: 0,
       isFallback: true,
       createdAt: now(),
     };
@@ -508,6 +299,8 @@ export class PipelineManager {
         vertex: { ...vCompiled, module: linked.vertexModule },
         fragment: { ...fCompiled, module: linked.fragmentModule },
         uniformLayout: [...vCompiled.uniformNames, ...fCompiled.uniformNames],
+        sourceId: 'fault-injection:custom',
+        sourceEdition: 0,
         createdAt: now(), compileMs: 0,
       };
       this.cache.set(identity.key, variant);
@@ -524,33 +317,243 @@ export class PipelineManager {
       variants: [...this.cache.values()].map((v) => ({
         key: v.key,
         struct: v.struct,
-        stage: v.identity?.stage ?? null,
         targetState: v.targetState,
         isFallback: !!v.isFallback,
-        inUse: v.inUse ?? 0,
-        bindingLayoutHash: v.bindingLayout?.hash ?? null,
         compileMs: v.compileMs,
         uniformLayout: v.uniformLayout,
+        sourceId: v.sourceId,
+        sourceEdition: v.sourceEdition,
       })),
       retired: [...this.retired.values()].map((r) => ({
         key: r.variant.key,
-        reason: r.reason,
+        sourceId: r.variant.sourceId,
+        sourceEdition: r.variant.sourceEdition,
         retiredAt: r.retiredAt,
-        inUse: r.variant.inUse ?? 0,
+        reason: r.reason,
       })),
       failures: [...this.failures.entries()].map(([key, f]) => ({
         key,
         struct: f.struct,
         at: f.at,
+        sourceId: f.sourceId ?? null,
+        sourceEdition: f.sourceEdition ?? null,
         diagnostic: {
           stage: f.diagnostic.stage,
           phase: f.diagnostic.phase,
           message: f.diagnostic.message,
           sourceLine: f.diagnostic.sourceLine,
         },
-        bindingErrors: f.bindingErrors ?? null,
       })),
       log: this.compilerLog.slice(-50),
     };
+  }
+
+  // ============ 着色器源码热换 ============
+
+  // 只做"候选编译 + 资源布局检查"，不触碰任何在用管线。
+  // 同步阶段（预处理/解析/语义/绑定布局）失败立即抛出带阶段的诊断；
+  // 链接（模块 import）异步进行，由调用方在 await 后做编辑版本裁决。
+  prepareHotSwap({ fragmentSource, struct, sourceId, sourceEdition, layoutValidator }) {
+    const normalized = normalizeStruct(struct, STRUCT_FIELDS);
+    const defines = {
+      NORMAL_MAP: normalized.NORMAL_MAP,
+      BLEND_MODE: normalized.BLEND_MODE,
+      LIGHTING: normalized.LIGHTING,
+    };
+    const vCompiled = this.#compileStage('vertex', VERTEX_SHADER, defines);
+    const fCompiled = this.#compileStage('fragment', fragmentSource, defines);
+    const uniformLayout = [...vCompiled.uniformNames, ...fCompiled.uniformNames];
+
+    // 资源布局检查在切换前完成：不兼容的绑定组根本不会进入链接/切换
+    let bindingLayout;
+    try {
+      bindingLayout = layoutValidator
+        ? layoutValidator(uniformLayout)
+        : uniformLayout;
+    } catch (e) {
+      const diagnostic = e instanceof BindingLayoutError
+        ? new CompileDiagnostic('fragment', 'layout', e.message, null)
+        : e;
+      this.compilerLog.push({
+        type: 'hotswap-failed', sourceId, sourceEdition,
+        error: diagnostic.message, phase: 'layout', at: now(),
+      });
+      throw diagnostic;
+    }
+
+    const identity = buildVariantIdentity({
+      vertexSource: vCompiled.preprocessedSource,
+      fragmentSource: fCompiled.preprocessedSource,
+      layout: this.layout,
+      struct: normalized,
+      // 模板源码的热换（如回退）沿用 graphics 身份，正确复用静态变体缓存
+      stage: sourceId === TEMPLATE_SOURCE_ID ? 'graphics' : 'hotswap',
+    });
+    return {
+      identity,
+      struct: normalized,
+      vCompiled,
+      fCompiled,
+      uniformLayout,
+      bindingLayout,
+      sourceId,
+      sourceEdition,
+      // 真正的模块链接延迟到调用方裁决前；调用方持有 job 以支持门控测试
+      link: () => this.#link(vCompiled.js, fCompiled.js, 'hotswap'),
+    };
+  }
+
+  /**
+   * 运行中热换：候选先编译并检查资源布局，通过后才链接；
+   * 结果带编辑版本，由 isLatest 裁决晚到的旧结果不得覆盖新代码。
+   * 失败不改变任何在用管线，只返回诊断（先前可运行版本由调用方继续持有）。
+   */
+  async compileHotSwap(request, isLatest) {
+    let candidate;
+    try {
+      candidate = this.prepareHotSwap(request);
+    } catch (diagnostic) {
+      this.#recordHotSwapFailure(request, diagnostic);
+      return {
+        status: HotSwapStatus.FAILED,
+        sourceId: request.sourceId, sourceEdition: request.sourceEdition,
+        reason: diagnostic.message, diagnostic,
+      };
+    }
+
+    // 身份未变（典型：回退到模板源码）直接复用静态变体缓存，不重复链接
+    const cached = this.cache.get(candidate.identity.key);
+    if (cached) {
+      this.compilerLog.push({
+        type: 'hotswap-cache-hit', sourceId: request.sourceId,
+        sourceEdition: request.sourceEdition, key: cached.key, at: now(),
+      });
+      return {
+        status: HotSwapStatus.PUBLISHED,
+        sourceId: request.sourceId, sourceEdition: request.sourceEdition,
+        variant: cached, identity: candidate.identity,
+        bindingLayout: candidate.bindingLayout, fromCache: true,
+      };
+    }
+
+    let linked;
+    try {
+      linked = await candidate.link();
+    } catch (diagnostic) {
+      this.#recordHotSwapFailure(request, diagnostic);
+      return {
+        status: HotSwapStatus.FAILED,
+        sourceId: request.sourceId, sourceEdition: request.sourceEdition,
+        reason: diagnostic.message, diagnostic,
+      };
+    }
+
+    // 链接返回期间用户已连续保存并提交新版本：旧结果即使成功也不得覆盖
+    if (!isLatest(request.sourceEdition)) {
+      this.compilerLog.push({
+        type: 'hotswap-stale', sourceId: request.sourceId,
+        sourceEdition: request.sourceEdition, key: candidate.identity.key, at: now(),
+      });
+      return {
+        status: HotSwapStatus.REJECTED_STALE,
+        sourceId: request.sourceId, sourceEdition: request.sourceEdition,
+        reason: `编辑版本 ${request.sourceEdition} 已过期，结果丢弃，不覆盖当前代码`,
+        identity: candidate.identity,
+      };
+    }
+
+    const variant = {
+      key: candidate.identity.key,
+      identity: candidate.identity,
+      struct: candidate.struct,
+      targetState: targetStateFromStruct(candidate.struct),
+      layout: this.layout,
+      vertex: { ...candidate.vCompiled, module: linked.vertexModule },
+      fragment: { ...candidate.fCompiled, module: linked.fragmentModule },
+      uniformLayout: candidate.uniformLayout,
+      bindingLayout: candidate.bindingLayout,
+      sourceId: request.sourceId,
+      sourceEdition: request.sourceEdition,
+      createdAt: now(),
+      compileMs: candidate.fCompiled.compileMs + candidate.vCompiled.compileMs,
+    };
+    this.cache.set(variant.key, variant);
+    // 同一源码的旧失败条目被新成功结果取代
+    for (const [key, f] of this.failures) {
+      if (f.sourceId === request.sourceId) this.failures.delete(key);
+    }
+    this.compilerLog.push({
+      type: 'hotswap-compiled', sourceId: request.sourceId,
+      sourceEdition: request.sourceEdition, key: variant.key, at: now(),
+    });
+    return {
+      status: HotSwapStatus.PUBLISHED,
+      sourceId: request.sourceId, sourceEdition: request.sourceEdition,
+      variant, identity: candidate.identity, bindingLayout: candidate.bindingLayout,
+    };
+  }
+
+  #recordHotSwapFailure(request, diagnostic) {
+    const key = `hotswap|${request.sourceId}|e${request.sourceEdition}|${sha256Short(request.fragmentSource)}`;
+    this.failures.set(key, {
+      diagnostic, struct: request.struct, at: now(),
+      sourceId: request.sourceId, sourceEdition: request.sourceEdition,
+    });
+    this.compilerLog.push({
+      type: 'hotswap-failed', sourceId: request.sourceId,
+      sourceEdition: request.sourceEdition, key,
+      error: diagnostic.message, phase: diagnostic.phase, at: now(),
+    });
+  }
+
+  /**
+   * 源码更新：只使相关条目失效（按 sourceId），其他源码的静态变体缓存继续有效。
+   * keepKey 为本次新采用的变体（同 sourceId 的新版本），必须保留。
+   * 仍被在用材质引用的变体进入 retired 延迟回收，而不是立刻释放；
+   * 未被引用的条目立即回收。
+   */
+  invalidateSource(sourceId, activeVariantKeys, keepKey = null) {
+    const active = new Set(activeVariantKeys);
+    const invalidated = [];
+    for (const [key, variant] of this.cache) {
+      if (variant.sourceId !== sourceId) continue;
+      if (key === keepKey) continue; // 新版本自身保留在缓存
+      this.cache.delete(key);
+      if (active.has(key)) {
+        this.retired.set(key, { variant, retiredAt: now(), reason: `source-update:${sourceId}` });
+      }
+      invalidated.push(key);
+    }
+    for (const [key, f] of this.failures) {
+      if (f.sourceId === sourceId) this.failures.delete(key);
+    }
+    if (invalidated.length) {
+      this.compilerLog.push({
+        type: 'source-invalidated', sourceId,
+        keys: invalidated, retired: [...this.retired.keys()], at: now(),
+      });
+    }
+    return invalidated;
+  }
+
+  // 在用材质完成切换后调用：确认旧管线已无引用，真正释放延迟回收的条目
+  releaseRetired(activeVariantKeys) {
+    const active = new Set(activeVariantKeys);
+    const released = [];
+    for (const [key, entry] of this.retired) {
+      if (!active.has(key)) {
+        this.retired.delete(key);
+        released.push(key);
+      }
+    }
+    if (released.length) {
+      this.compilerLog.push({ type: 'retired-released', keys: released, at: now() });
+    }
+    return released;
+  }
+
+  // 场景切换期间仍在编译的任务数（资源释放核对使用）
+  get pendingWork() {
+    return { inFlight: this.inFlight, retired: this.retired.size };
   }
 }

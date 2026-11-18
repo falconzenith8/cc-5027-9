@@ -27,3 +27,4 @@ __pycache__/
 # Material preview CLI generated frames
 /material-preview/preview-frame.png
 /material-preview/frame.png
+/material-preview/hotswap-frame.png

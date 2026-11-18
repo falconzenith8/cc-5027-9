@@ -217,12 +217,115 @@ async function requestFrame(mesh) {
     img.src = url;
     img.onload = () => URL.revokeObjectURL(url);
     $('frameMeta').textContent =
-      `#${res.headers.get('x-frame-seq')} · ${res.headers.get('x-render-ms')}ms · ` +
-      (res.headers.get('x-fallback') === '1' ? '替代材质帧' : '真实变体裁剪帧');
+      `#${res.headers.get('x-frame-seq')} · ${res.headers.get('x-render-ms')}ms · `
+      + `${res.headers.get('x-source-id')}@e${res.headers.get('x-source-edition')} · `
+      + (res.headers.get('x-fallback') === '1' ? '替代材质帧' : '真实变体裁剪帧');
   } catch (e) {
     setGlobal('err', '渲染失败: ' + e.message);
     logEvent(`渲染异常：<b>${e.message}</b>`, 'failed');
   }
+}
+
+// ---- 着色器源码热换（运行中替换）----
+function renderShaderPanel(shader) {
+  if (!shader) return;
+  $('shaderDraft').value = shader.draft.source;
+  $('shaderPublished').value = shader.published.source;
+  $('publishedEdition').textContent = `版本 ${shader.published.edition}`;
+  $('draftFlag').textContent = shader.draft.differsFromPublished ? '草稿未发布' : '与已发布一致';
+  $('draftFlag').className = 'tag ' + (shader.draft.differsFromPublished ? 'danger' : 'ok');
+
+  const pill = $('hotswapPill');
+  const meta = $('hotswapMeta');
+  const hs = shader.hotswap;
+  if (!hs) { pill.className = 'status-pill'; pill.textContent = '—'; meta.textContent = '未提交'; return; }
+  const map = {
+    compiling: ['compiling', '编译中…'],
+    published: ['published', '已发布并生效'],
+    failed: ['failed', '编译失败（保留旧版本）'],
+    stale: ['stale', '旧结果已过期丢弃'],
+  };
+  const [cls, label] = map[hs.status] ?? ['', hs.status];
+  pill.className = 'status-pill ' + cls;
+  pill.textContent = label;
+  meta.textContent = `提交版本 ${hs.submittedEdition} / 已发布 ${hs.publishedEdition}`
+    + (hs.reason ? ` · ${hs.reason}` : '');
+
+  const box = $('hotswapResult');
+  if (hs.status === 'published') {
+    box.classList.remove('hidden', 'fail'); box.classList.add('ok');
+    const d = hs.layoutDiff;
+    const lines = [`已发布编辑版本 ${hs.submittedEdition}，流送视窗已更新为该着色结果。`];
+    if (d) {
+      const fmt = (arr) => arr.map((u) => (u.name ? `${u.name}:${u.type}` : u)).join(', ') || '无';
+      lines.push(`新增 uniform: ${fmt(d.uniformsAdded)}`);
+      lines.push(`移除 uniform: ${fmt(d.uniformsRemoved)}`);
+      lines.push(`新增采样器: ${d.samplersAdded.join(', ') || '无'}`);
+      lines.push(`移除采样器: ${d.samplersRemoved.join(', ') || '无'}`);
+    }
+    box.textContent = lines.join('\n');
+  } else if (hs.status === 'failed' && hs.diagnostic) {
+    box.classList.remove('hidden', 'ok'); box.classList.add('fail');
+    box.textContent = `阶段: ${hs.diagnostic.stage}/${hs.diagnostic.phase}\n`
+      + `行: ${hs.diagnostic.sourceLine ?? '?'}\n诊断: ${hs.diagnostic.message}\n`
+      + '当前画面仍为先前可运行版本，新效果未生效。';
+  } else if (hs.status === 'stale') {
+    box.classList.remove('hidden', 'ok', 'fail');
+    box.textContent = `编辑版本 ${hs.submittedEdition} 返回时已过期，结果被丢弃，未覆盖更新的代码。`;
+  } else {
+    box.classList.add('hidden');
+  }
+}
+
+$('saveDraftBtn').onclick = async () => {
+  try {
+    const shader = await api('/api/shader/draft', { source: $('shaderDraft').value });
+    state.shader = shader;
+    renderShaderPanel(shader);
+    logEvent('着色器草稿已保存（<b>未编译，画面不变</b>）', 'cache-hit');
+  } catch (e) {
+    logEvent(`保存草稿失败：<b>${e.message}</b>`, 'failed');
+  }
+};
+
+$('applyShaderBtn').onclick = async () => {
+  if (busy) return;
+  busy = true; setGlobal('busy', '编译候选着色器并检查资源布局…');
+  try {
+    const shader = await api('/api/shader/apply', { source: $('shaderDraft').value });
+    state.shader = shader;
+    renderShaderPanel(shader);
+    if (shader.hotswap.status === 'published') {
+      logEvent(`着色器热换发布 <b>版本 ${shader.hotswap.submittedEdition}</b>，视窗更新`, 'compiled');
+    } else if (shader.hotswap.status === 'failed') {
+      logEvent(`热换失败：<b>${shader.hotswap.diagnostic?.message ?? shader.hotswap.reason}</b>，旧版本保留`, 'failed');
+    } else {
+      logEvent(`热换结果：<b>${shader.hotswap.status}</b>`, 'failed');
+    }
+    await refreshAll(true); // 真实重新出帧：画面与编译状态来自后端实际运算
+  } catch (e) {
+    logEvent(`热换请求异常：<b>${e.message}</b>`, 'failed');
+    setGlobal('err', e.message);
+  } finally { busy = false; }
+};
+
+$('resetShaderBtn').onclick = async () => {
+  if (busy) return;
+  busy = true; setGlobal('busy', '回退模板着色器（真实重编译）…');
+  try {
+    const shader = await api('/api/shader/reset', {});
+    state.shader = shader;
+    renderShaderPanel(shader);
+    logEvent('已回退到模板着色器', 'cache-hit');
+    await refreshAll(true);
+  } catch (e) {
+    logEvent(`回退失败：<b>${e.message}</b>`, 'failed');
+  } finally { busy = false; }
+};
+
+// 切换材质后重新载入该材质的候选/已发布源码
+function refreshShaderPanel() {
+  get('/api/shader').then((shader) => { state.shader = shader; renderShaderPanel(shader); });
 }
 
 async function selectMaterial(id) {
@@ -246,99 +349,8 @@ async function refreshAll(render) {
   renderTextureAndMesh();
   renderCompileCard();
   renderVariantList();
-  renderShaderPanel();
+  refreshShaderPanel();
   if (render) await requestFrame();
-}
-
-// ---- 着色器热换面板 ----
-let shaderSourceLoadedFor = null;
-
-function renderShaderPanel() {
-  const prog = state.shaderProgram;
-  const box = $('shaderStatus');
-  const diag = $('shaderDiagnostic');
-  if (!prog) { box.textContent = '当前材质没有着色器程序'; return; }
-  const pub = prog.published;
-  const cand = prog.candidate;
-  const pubState = pub.status === 'ok'
-    ? (pub.matchesCurrentSource ? '已发布（与编辑器文本一致）' : '已发布（编辑器文本尚未编译）')
-    : '未发布（尚无成功版本）';
-  const candState = cand.status === 'compiling' ? '编译中…'
-    : cand.status === 'compiled' ? '候选已采用'
-      : cand.status === 'rejected' ? '候选被拒绝'
-        : cand.status === 'superseded' ? '候选已被更新修订取代'
-          : cand.status === 'rolled-back' ? '已回退' : '空闲';
-  box.innerHTML = `
-    <div class="srow"><span>已发布版本</span><b>${pubState}</b></div>
-    <div class="srow"><span>已发布修订</span><b>rev ${pub.revision} / 编辑 v${pub.editVersion}</b></div>
-    <div class="srow"><span>已发布变体</span><code>${pub.variantKey ?? '—'}</code></div>
-    <div class="srow"><span>绑定布局</span><code>${pub.bindingLayoutHash ?? '—'}</code></div>
-    <div class="srow"><span>候选状态</span><b>${candState}</b></div>
-    <div class="srow"><span>候选修订</span><b>rev ${cand.revision} / 编辑 v${cand.editVersion}${cand.compileMs != null ? ` · ${cand.compileMs.toFixed?.(2)}ms` : ''}</b></div>
-    <div class="srow"><span>文本 vs 画面</span><b>${prog.textDiffersFromPublished ? '文本已改，画面未更新' : '一致'}</b></div>`;
-  const errs = cand.bindingErrors?.length
-    ? cand.bindingErrors.map((e) => `[${e.code}] ${e.message}`).join('\n')
-    : null;
-  if (cand.status === 'rejected') {
-    diag.classList.remove('hidden');
-    diag.textContent = [
-      `候选编译失败：${cand.diagnostic?.stage ?? ''}/${cand.diagnostic?.phase ?? ''}`
-        + (cand.diagnostic?.sourceLine ? ` 行 ${cand.diagnostic.sourceLine}` : ''),
-      cand.diagnostic?.message ?? cand.error ?? '',
-      errs ? `绑定问题：\n${errs}` : '',
-      pub.status === 'ok' ? '→ 画面上仍运行上一份可运行版本' : '→ 当前没有可运行版本',
-    ].filter(Boolean).join('\n');
-  } else {
-    diag.classList.add('hidden');
-  }
-  // 仅在切换材质时载入源码，避免覆盖用户正在编辑的文本
-  if (shaderSourceLoadedFor !== prog.id && cand.status !== 'compiling') {
-    $('shaderSource').value = prog.source ?? '';
-    shaderSourceLoadedFor = prog.id;
-  }
-}
-
-async function saveShaderText() {
-  const accepted = await api('/api/shader/candidate', {
-    source: $('shaderSource').value,
-    materialId: state.currentMaterial.id,
-  });
-  logEvent(`着色器文本已保存 rev <b>${accepted.revision}</b>（画面未更新）`, 'cache-hit');
-  state = await get('/api/state');
-  renderShaderPanel();
-}
-
-async function compileShaderCandidate() {
-  if (busy) return;
-  busy = true; setGlobal('busy', '编译候选着色器…');
-  const box = $('shaderDiagnostic');
-  try {
-    const r = await api('/api/shader/compile', {
-      source: $('shaderSource').value,
-      materialId: state.currentMaterial.id,
-    });
-    state = r.state;
-    if (r.result.adopted) {
-      logEvent(`候选 rev <b>${r.result.revision}</b> 已采用 → ${r.result.variantKey}（影响 ${r.result.affectedInstances} 个实例）`, 'compiled');
-      $('shaderSource').value = state.shaderProgram.source;
-    } else if (r.result.superseded) {
-      logEvent(`候选 rev <b>${r.result.revision}</b> 已被更新修订取代，结果丢弃`, 'failed');
-    } else {
-      logEvent(`候选 rev <b>${r.result.revision}</b> 被拒绝：${r.result.reason}`, 'failed');
-    }
-    await refreshAll(true);
-  } catch (e) {
-    box.classList.remove('hidden');
-    box.textContent = '热换请求失败：' + e.message;
-    setGlobal('err', e.message);
-  } finally { busy = false; }
-}
-
-async function rollbackShader() {
-  const r = await api('/api/shader/rollback', { materialId: state.currentMaterial.id });
-  state = r.state;
-  logEvent(`已回退到已发布版本 <b>${r.result.key ?? '—'}</b>`, 'cache-hit');
-  await refreshAll(true);
 }
 
 // ---- 全局按钮 ----
@@ -413,9 +425,6 @@ $('pitch').oninput = async (e) => {
   scheduleFrame();
 };
 $('resolutionSelect').onchange = () => requestFrame();
-$('shaderSaveBtn').onclick = () => saveShaderText();
-$('shaderCompileBtn').onclick = () => compileShaderCandidate();
-$('shaderRollbackBtn').onclick = () => rollbackShader();
 
 // SSE：编译/帧/预热事件实时推送
 try {
@@ -425,8 +434,11 @@ try {
     if (data.type === 'compile') logEvent(`编译事件：<b>${data.result?.status}</b> 缓存=${data.result?.fromCache}`, 'compiled');
     if (data.type === 'prewarm') logEvent(`预热事件：编译 ${data.report?.compiled} / 跳过 ${data.report?.skipped}`, 'cache-hit');
     if (data.type === 'fault') logEvent(`SSE 故障事件：<b>${data.reason}</b>`, 'failed');
-    if (data.type === 'shader') logEvent(`着色器事件：<b>${data.stage}</b> rev ${data.revision ?? '—'} ${data.reason ? '— ' + data.reason : ''}`,
-      data.stage === 'published' ? 'compiled' : data.stage === 'rejected' ? 'failed' : 'cache-hit');
+    if (data.type === 'hotswap') {
+      const s = data.state;
+      if (s?.status === 'published') logEvent(`SSE 热换发布：版本 <b>${s.publishedEdition}</b> 已生效`, 'compiled');
+      else if (s?.status === 'failed') logEvent(`SSE 热换失败：<b>${s.reason}</b>，旧版本保留`, 'failed');
+    }
   };
 } catch { /* 无 SSE 时界面仍可手动操作 */ }
 
